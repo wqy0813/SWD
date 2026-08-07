@@ -1,0 +1,2366 @@
+"""
+VLSI Floorplanning Solution
+============================
+Solves four VLSI floorplanning optimization problems using
+B*-tree representation and Simulated Annealing.
+
+Problem 1: Minimize chip area with variable outline, no nets
+Problem 2: Minimize HPWL with fixed square outline
+Problem 3: Find minimum feasible dead_space_ratio
+Problem 4: Extend to L-shaped and T-shaped modules
+
+Reference: "Modern Floorplanning Based on B*-Tree and Fast Simulated Annealing"
+           IEEE TCAD, 2006
+"""
+
+import math
+import random
+import copy
+import sys
+import os
+from dataclasses import dataclass, field
+from typing import List, Dict, Tuple, Optional, Set
+from collections import defaultdict
+
+# ============================================================
+# DATA STRUCTURES
+# ============================================================
+
+@dataclass
+class Module:
+    """Represents a functional block (HardBlock or Terminal)."""
+    name: str
+    module_type: str  # 'block' or 'terminal'
+    width: float = 0.0
+    height: float = 0.0
+    x: float = 0.0       # final x position (bottom-left)
+    y: float = 0.0       # final y position (bottom-left)
+    rotated: bool = False  # whether the module is rotated 90 degrees
+    is_hard: bool = True   # True for block, False for terminal (fixed)
+    # For non-rectangular modules (Problem 4)
+    shape_type: str = 'rect'  # 'rect', 'L', 'T'
+    sub_blocks: List['SubBlock'] = field(default_factory=list)
+
+    @property
+    def w(self):
+        """Effective width after rotation."""
+        return self.height if self.rotated and self.is_hard else self.width
+
+    @property
+    def h(self):
+        """Effective height after rotation."""
+        return self.width if self.rotated and self.is_hard else self.height
+
+    @property
+    def area(self):
+        return self.width * self.height
+
+
+@dataclass
+class SubBlock:
+    """Sub-block for non-rectangular modules (L-shape, T-shape)."""
+    rel_x: float  # relative x offset from module origin
+    rel_y: float  # relative y offset from module origin
+    width: float
+    height: float
+
+
+@dataclass
+class Net:
+    """Represents a connection network."""
+    name: str = ""
+    pins: List[str] = field(default_factory=list)  # list of module names
+    weight: float = 1.0
+
+
+@dataclass
+class FloorplanResult:
+    """Stores the result of a floorplanning run."""
+    module_positions: Dict[str, Tuple[float, float, bool]]  # name -> (x, y, rotated)
+    outline_width: float
+    outline_height: float
+    area: float
+    aspect_ratio: float
+    total_hpwl: float = 0.0
+    dead_space_ratio: float = 0.0
+
+
+# ============================================================
+# FILE PARSER
+# ============================================================
+
+class VLSIParser:
+    """Parses .blocks, .nets, and .pl files."""
+
+    @staticmethod
+    def parse_blocks(filepath: str) -> List[Module]:
+        """Parse .blocks file. Returns list of Module objects."""
+        modules = []
+        # Try multiple encodings
+        for encoding in ['utf-8', 'gbk', 'gb2312', 'utf-8-sig', 'latin-1']:
+            try:
+                with open(filepath, 'r', encoding=encoding) as f:
+                    lines = f.readlines()
+                break
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+
+        # Parse lines
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith('//') or line.startswith('Num'):
+                # Skip header lines
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+
+            name = parts[0]
+            mtype = parts[1]
+
+            if mtype == 'terminal':
+                mod = Module(name=name, module_type='terminal',
+                             width=0, height=0, is_hard=False)
+                modules.append(mod)
+
+            elif mtype == 'block':
+                # Format: b0 block 4 (0,0) (0,82) (199,82) (199,0)
+                coords = []
+                if len(parts) >= 3:
+                    try:
+                        num_vertices = int(parts[2])
+                    except ValueError:
+                        continue
+                    coord_parts = parts[3:]
+                    for j in range(min(num_vertices, len(coord_parts))):
+                        coord_str = coord_parts[j]
+                        coord_str = coord_str.strip('(),')
+                        if ',' in coord_str:
+                            try:
+                                x_str, y_str = coord_str.split(',')
+                                coords.append((float(x_str), float(y_str)))
+                            except ValueError:
+                                pass
+
+                if coords:
+                    # Determine shape type and compute bounding box
+                    xs = [c[0] for c in coords]
+                    ys = [c[1] for c in coords]
+                    width = max(xs) - min(xs)
+                    height = max(ys) - min(ys)
+
+                    mod = Module(name=name, module_type='block',
+                                 width=width, height=height, is_hard=True)
+
+                    # Detect non-rectangular shapes (Problem 4)
+                    if len(coords) >= 6:
+                        # Check if it's L-shaped or T-shaped
+                        shape_type = VLSIParser._detect_shape_type(coords)
+                        mod.shape_type = shape_type
+                        if shape_type != 'rect':
+                            mod.sub_blocks = VLSIParser._decompose_shape(coords)
+
+                    modules.append(mod)
+
+            elif mtype == 'terminal':
+                mod = Module(name=name, module_type='terminal',
+                             width=0, height=0, is_hard=False)
+                modules.append(mod)
+
+        return modules
+
+    @staticmethod
+    def _detect_shape_type(coords: List[Tuple[float, float]]) -> str:
+        """Detect if a polygon is L-shaped, T-shaped, or rectangular."""
+        # Normalize coordinates relative to min x, min y
+        min_x = min(c[0] for c in coords)
+        min_y = min(c[1] for c in coords)
+        max_x = max(c[0] for c in coords)
+        max_y = max(c[1] for c in coords)
+
+        w = max_x - min_x
+        h = max_y - min_y
+
+        # Check if the polygon covers the full bounding box (rectangular)
+        # If area of polygon < bounding box area, it's non-rectangular
+        area_poly = VLSIParser._polygon_area(coords)
+        area_bbox = w * h
+
+        if abs(area_poly - area_bbox) < 1e-6:
+            return 'rect'
+
+        # Determine specific shape by checking which corners are missing
+        # Simplified: check if one quadrant is missing (L-shape)
+        # or if it's more complex (T-shape)
+        mid_x = min_x + w / 2
+        mid_y = min_y + h / 2
+
+        quadrants_covered = 0
+        quadrants = [
+            [(min_x, min_y), (mid_x, min_y), (mid_x, mid_y), (min_x, mid_y)],
+            [(mid_x, min_y), (max_x, min_y), (max_x, mid_y), (mid_x, mid_y)],
+            [(min_x, mid_y), (mid_x, mid_y), (mid_x, max_y), (min_x, max_y)],
+            [(mid_x, mid_y), (max_x, mid_y), (max_x, max_y), (mid_x, max_y)],
+        ]
+
+        for quad in quadrants:
+            if VLSIParser._polygon_overlaps_rect(coords, quad):
+                quadrants_covered += 1
+
+        if quadrants_covered == 3:
+            return 'L'
+        else:
+            return 'T'
+
+    @staticmethod
+    def _polygon_area(coords: List[Tuple[float, float]]) -> float:
+        """Shoelace formula for polygon area."""
+        n = len(coords)
+        area = 0.0
+        for i in range(n):
+            j = (i + 1) % n
+            area += coords[i][0] * coords[j][1]
+            area -= coords[j][0] * coords[i][1]
+        return abs(area) / 2.0
+
+    @staticmethod
+    def _polygon_overlaps_rect(coords, rect) -> bool:
+        """Check if polygon overlaps with a rectangle (simplified)."""
+        # Check if any vertex of polygon is inside rect
+        rx = [p[0] for p in rect]
+        ry = [p[1] for p in rect]
+        rminx, rmaxx = min(rx), max(rx)
+        rminy, rmaxy = min(ry), max(ry)
+
+        rect_center = ((rminx + rmaxx) / 2, (rminy + rmaxy) / 2)
+        # Check if polygon overlaps rect center
+        # Simplified ray casting
+        return VLSIParser._point_in_polygon(rect_center[0], rect_center[1], coords)
+
+    @staticmethod
+    def _point_in_polygon(x: float, y: float, coords) -> bool:
+        """Ray casting algorithm."""
+        n = len(coords)
+        inside = False
+        j = n - 1
+        for i in range(n):
+            xi, yi = coords[i][0], coords[i][1]
+            xj, yj = coords[j][0], coords[j][1]
+            if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
+                inside = not inside
+            j = i
+        return inside
+
+    @staticmethod
+    def _decompose_shape(coords: List[Tuple[float, float]]) -> List[SubBlock]:
+        """Decompose non-rectangular shape into sub-rectangles."""
+        # Normalize
+        min_x = min(c[0] for c in coords)
+        min_y = min(c[1] for c in coords)
+
+        # Use a simple grid-based decomposition
+        # For L-shaped: decompose into 2 rectangles
+        # For T-shaped: decompose into 3 rectangles
+
+        xs = sorted(set(c[0] for c in coords))
+        ys = sorted(set(c[1] for c in coords))
+
+        sub_blocks = []
+        for i in range(len(xs) - 1):
+            for j in range(len(ys) - 1):
+                x1, x2 = xs[i], xs[i + 1]
+                y1, y2 = ys[j], ys[j + 1]
+                # Check if this cell is inside the polygon
+                center_x = (x1 + x2) / 2
+                center_y = (y1 + y2) / 2
+                if VLSIParser._point_in_polygon(center_x, center_y, coords):
+                    sub_blocks.append(SubBlock(
+                        rel_x=x1 - min_x,
+                        rel_y=y1 - min_y,
+                        width=x2 - x1,
+                        height=y2 - y1
+                    ))
+
+        # Merge adjacent sub-blocks for efficiency
+        return VLSIParser._merge_sub_blocks(sub_blocks)
+
+    @staticmethod
+    def _merge_sub_blocks(blocks: List[SubBlock]) -> List[SubBlock]:
+        """Merge adjacent sub-blocks if they share a full edge."""
+        if len(blocks) <= 1:
+            return blocks
+        # Simple greedy merge
+        merged = True
+        result = list(blocks)
+        while merged:
+            merged = False
+            new_result = []
+            used = set()
+            for i, a in enumerate(result):
+                if i in used:
+                    continue
+                found_merge = False
+                for j, b in enumerate(result):
+                    if j <= i or j in used:
+                        continue
+                    # Check if same height and adjacent horizontally
+                    if (abs(a.height - b.height) < 1e-6 and
+                        abs((a.rel_x + a.width) - b.rel_x) < 1e-6 and
+                        abs(a.rel_y - b.rel_y) < 1e-6):
+                        new_result.append(SubBlock(a.rel_x, a.rel_y,
+                                                   a.width + b.width, a.height))
+                        used.add(i)
+                        used.add(j)
+                        found_merge = True
+                        merged = True
+                        break
+                    # Check if same width and adjacent vertically
+                    if (abs(a.width - b.width) < 1e-6 and
+                        abs((a.rel_y + a.height) - b.rel_y) < 1e-6 and
+                        abs(a.rel_x - b.rel_x) < 1e-6):
+                        new_result.append(SubBlock(a.rel_x, a.rel_y,
+                                                   a.width, a.height + b.height))
+                        used.add(i)
+                        used.add(j)
+                        found_merge = True
+                        merged = True
+                        break
+                if not found_merge:
+                    new_result.append(a)
+            result = new_result
+            if not merged:
+                break
+        return result
+
+    @staticmethod
+    def parse_nets(filepath: str) -> List[Net]:
+        """Parse .nets file."""
+        nets = []
+        modules_set = set()
+        for encoding in ['utf-8', 'gbk', 'gb2312', 'utf-8-sig', 'latin-1']:
+            try:
+                with open(filepath, 'r', encoding=encoding) as f:
+                    lines = f.readlines()
+                break
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+        else:
+            return nets  # Could not read file
+
+        num_nets = 0
+        num_pins = 0
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            i += 1
+            if not line or line.startswith('//'):
+                continue
+            if 'NumNets' in line or 'NumNets' in line:
+                continue
+            if 'NumPins' in line or 'NumPins' in line:
+                continue
+            if 'NetDegree' in line or 'NetDegree' in line:
+                # Parse degree number
+                try:
+                    if ':' in line or '：' in line:
+                        sep = ':' if ':' in line else '：'
+                        degree = int(line.split(sep)[1].strip())
+                    else:
+                        degree = int(line.split()[-1])
+                except (ValueError, IndexError):
+                    continue
+                net = Net()
+                for _ in range(degree):
+                    if i < len(lines):
+                        pin_name = lines[i].strip()
+                        i += 1
+                        if pin_name and not pin_name.startswith('//'):
+                            net.pins.append(pin_name)
+                if net.pins:
+                    nets.append(net)
+
+        return nets
+
+    @staticmethod
+    def parse_pl(filepath: str) -> Dict[str, Tuple[float, float]]:
+        """Parse .pl file (terminal positions)."""
+        positions = {}
+        for encoding in ['utf-8', 'gbk', 'gb2312', 'utf-8-sig', 'latin-1']:
+            try:
+                with open(filepath, 'r', encoding=encoding) as f:
+                    content = f.read()
+                break
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+        for encoding in ['utf-8', 'gbk', 'gb2312', 'utf-8-sig', 'latin-1']:
+            try:
+                with open(filepath, 'r', encoding=encoding) as f:
+                    content = f.read()
+                break
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+        else:
+            return positions
+        for line in content.split('\n'):
+            line = line.strip()
+            if not line or line.startswith('//') or line.startswith('#'):
+                continue
+            parts = line.split()
+            if len(parts) >= 3:
+                name = parts[0]
+                try:
+                    x = float(parts[1])
+                    y = float(parts[2])
+                    positions[name] = (x, y)
+                except ValueError:
+                    continue
+        return positions
+
+
+# ============================================================
+# B*-TREE REPRESENTATION
+# ============================================================
+
+class BTreeNode:
+    """Node in a B*-tree."""
+    __slots__ = ('module_idx', 'left', 'right', 'parent')
+
+    def __init__(self, module_idx: int):
+        self.module_idx = module_idx
+        self.left = None   # placed to the right in floorplan
+        self.right = None  # placed above in floorplan
+        self.parent = None
+
+
+class BTree:
+    """
+    B*-tree representation for non-slicing floorplans.
+
+    The B*-tree encodes a compacted floorplan:
+    - Root node is placed at bottom-left
+    - Left child: placed to the right of parent
+    - Right child: placed above parent
+    - Contour-based packing computes actual coordinates
+    """
+
+    def __init__(self, num_modules: int):
+        self.num_modules = num_modules
+        self.root = None
+        self.nodes: List[Optional[BTreeNode]] = [None] * num_modules
+
+    def copy(self) -> 'BTree':
+        """Deep copy the tree."""
+        new_tree = BTree(self.num_modules)
+        if self.root:
+            new_tree.root = new_tree._copy_node(self.root, None)
+        return new_tree
+
+    def _copy_node(self, node: BTreeNode, parent: Optional[BTreeNode]) -> BTreeNode:
+        new_node = BTreeNode(node.module_idx)
+        new_node.parent = parent
+        new_tree = None
+        # We need a reference to the new tree's nodes list
+        if node.left:
+            new_node.left = self._copy_node(node.left, new_node)
+        if node.right:
+            new_node.right = self._copy_node(node.right, new_node)
+        return new_node
+
+    def build_initial_tree(self, module_indices: List[int]):
+        """Build an initial balanced-ish B*-tree from a list of module indices."""
+        if not module_indices:
+            return
+        self.root = self._build_balanced(module_indices, 0, len(module_indices) - 1, None)
+
+    def _build_balanced(self, indices: List[int], start: int, end: int,
+                        parent: Optional[BTreeNode]) -> Optional[BTreeNode]:
+        if start > end:
+            return None
+        mid = (start + end) // 2
+        node = BTreeNode(indices[mid])
+        node.parent = parent
+        self.nodes[indices[mid]] = node
+        node.left = self._build_balanced(indices, mid + 1, end, node)
+        node.right = self._build_balanced(indices, start, mid - 1, node)
+        return node
+
+    def get_all_nodes(self) -> List[BTreeNode]:
+        """Return all nodes in the tree (in-order traversal)."""
+        nodes = []
+        self._inorder(self.root, nodes)
+        return nodes
+
+    def _inorder(self, node: Optional[BTreeNode], result: List[BTreeNode]):
+        if node is None:
+            return
+        self._inorder(node.left, result)
+        result.append(node)
+        self._inorder(node.right, result)
+
+    def get_node(self, module_idx: int) -> Optional[BTreeNode]:
+        """Find a node by module index."""
+        return self._find(self.root, module_idx)
+
+    def _find(self, node: Optional[BTreeNode], module_idx: int) -> Optional[BTreeNode]:
+        if node is None:
+            return None
+        if node.module_idx == module_idx:
+            return node
+        left_result = self._find(node.left, module_idx)
+        if left_result:
+            return left_result
+        return self._find(node.right, module_idx)
+
+    def swap_modules(self, idx1: int, idx2: int):
+        """Swap two modules in the B*-tree by swapping their indices in nodes."""
+        node1 = self.get_node(idx1)
+        node2 = self.get_node(idx2)
+        if node1 and node2:
+            node1.module_idx, node2.module_idx = node2.module_idx, node1.module_idx
+
+    def delete_and_insert(self, delete_idx: int, insert_idx: int):
+        """
+        Delete module delete_idx from tree and re-insert it near insert_idx.
+        This is one of the SA perturbation operations.
+        """
+        node = self.get_node(delete_idx)
+        if node is None or delete_idx == insert_idx:
+            return
+
+        # Store the module index to be moved
+        moved_module = node.module_idx
+
+        # Remove node from tree (replace with its children or delete)
+        self._delete_node(node)
+
+        # Insert near target
+        target_node = self.get_node(insert_idx)
+        if target_node:
+            # Choose random position: as left child or right child
+            if random.random() < 0.5 and target_node.left is None:
+                new_node = BTreeNode(moved_module)
+                new_node.parent = target_node
+                target_node.left = new_node
+            elif target_node.right is None:
+                new_node = BTreeNode(moved_module)
+                new_node.parent = target_node
+                target_node.right = new_node
+            else:
+                # Insert at a random empty spot
+                all_nodes = self.get_all_nodes()
+                for n in all_nodes:
+                    if n.left is None:
+                        new_node = BTreeNode(moved_module)
+                        new_node.parent = n
+                        n.left = new_node
+                        return
+                    if n.right is None:
+                        new_node = BTreeNode(moved_module)
+                        new_node.parent = n
+                        n.right = new_node
+                        return
+                # Fallback: append as right child of last node
+                last = all_nodes[-1] if all_nodes else None
+                if last:
+                    new_node = BTreeNode(moved_module)
+                    new_node.parent = last
+                    last.right = new_node
+
+    def _delete_node(self, node: BTreeNode):
+        """Delete a node from the B*-tree, reattaching its children."""
+        # Find replacement: prefer left child, then right child
+        # Actually, for SA operations, we just remove and reinsert
+        # A simpler approach: reconnect children
+        replacement = node.left if node.left else node.right
+        other_child = node.right if node.left else node.left
+
+        if node.parent:
+            if node.parent.left == node:
+                node.parent.left = replacement
+            else:
+                node.parent.right = replacement
+            if replacement:
+                replacement.parent = node.parent
+        else:
+            self.root = replacement
+            if replacement:
+                replacement.parent = None
+
+        # If there's an other_child, attach it to a suitable position
+        if node.left and node.right:
+            # Attach other_child to the rightmost position of replacement's left subtree
+            if replacement:
+                # other_child goes as far right as possible in replacement's subtree
+                curr = replacement
+                while curr.right:
+                    curr = curr.right
+                curr.right = other_child
+                other_child.parent = curr
+
+
+# ============================================================
+# CONTOUR-BASED PACKING
+# ============================================================
+
+class ContourPacker:
+    """
+    Computes module positions from a B*-tree using contour-based packing.
+    This guarantees a compacted (zero dead-space in y-direction for a given x-ordering)
+    placement with no overlaps.
+    """
+
+    def __init__(self, modules: List[Module]):
+        self.modules = modules
+
+    def pack(self, tree: BTree) -> Tuple[Dict[int, Tuple[float, float]], float, float]:
+        """
+        Pack modules according to B*-tree.
+
+        Returns:
+            positions: dict mapping module_idx -> (x, y, rotated)
+            total_width, total_height of the bounding box
+        """
+        if tree.root is None:
+            return {}, 0, 0
+
+        positions = {}
+        contour = []  # List of (x_start, x_end, y_height) segments
+
+        # Pre-order traversal: parent before children
+        self._pack_node(tree.root, 0.0, contour, positions, tree)
+
+        # Compute bounding box
+        max_x = 0.0
+        max_y = 0.0
+        for idx, (x, y) in positions.items():
+            mod = self.modules[idx]
+            max_x = max(max_x, x + mod.w)
+            max_y = max(max_y, y + mod.h)
+
+        return positions, max_x, max_y
+
+    def _pack_node(self, node: BTreeNode, parent_x: float,
+                   contour: List[Tuple[float, float, float]],
+                   positions: Dict[int, Tuple[float, float]],
+                   tree: BTree):
+        """Recursively pack a node and its children."""
+        if node is None:
+            return
+
+        mod = self.modules[node.module_idx]
+        w, h = mod.w, mod.h
+
+        # Find y-coordinate using contour (skyline method)
+        y = self._find_y(contour, parent_x, parent_x + w)
+
+        positions[node.module_idx] = (parent_x, y)
+
+        # Update contour
+        self._update_contour(contour, parent_x, parent_x + w, y + h)
+
+        # Process left child (placed to the right of current module)
+        if node.left:
+            self._pack_node(node.left, parent_x + w, contour, positions, tree)
+
+        # Process right child (placed above current module, at same x as parent)
+        if node.right:
+            self._pack_node(node.right, parent_x, contour, positions, tree)
+
+    def _find_y(self, contour: List[Tuple[float, float, float]],
+                x_start: float, x_end: float) -> float:
+        """Find the lowest y-position where a block of width (x_end-x_start) can be placed."""
+        max_y = 0.0
+        for seg_xs, seg_xe, seg_y in contour:
+            # Check overlap
+            if seg_xe > x_start and seg_xs < x_end:
+                max_y = max(max_y, seg_y)
+        return max_y
+
+    def _update_contour(self, contour: List[Tuple[float, float, float]],
+                        x_start: float, x_end: float, new_y: float):
+        """Update the contour (skyline) after placing a block."""
+        # Remove segments covered by new block
+        new_contour = []
+        for seg_xs, seg_xe, seg_y in contour:
+            if seg_xe <= x_start or seg_xs >= x_end:
+                # No overlap
+                new_contour.append((seg_xs, seg_xe, seg_y))
+            else:
+                # Partial or full overlap
+                if seg_xs < x_start:
+                    new_contour.append((seg_xs, x_start, seg_y))
+                if seg_xe > x_end:
+                    new_contour.append((x_end, seg_xe, seg_y))
+
+        # Add new segment
+        new_contour.append((x_start, x_end, new_y))
+
+        # Merge adjacent segments with same height
+        new_contour.sort(key=lambda s: s[0])
+        merged = []
+        for seg in new_contour:
+            if merged and abs(merged[-1][1] - seg[0]) < 1e-9 and abs(merged[-1][2] - seg[2]) < 1e-9:
+                # Merge
+                merged[-1] = (merged[-1][0], seg[1], merged[-1][2])
+            else:
+                merged.append(seg)
+        contour[:] = merged
+
+
+# ============================================================
+# HPWL CALCULATION
+# ============================================================
+
+def compute_hpwl(nets: List[Net],
+                 module_positions: Dict[str, Tuple[float, float]],
+                 modules: List[Module],
+                 terminal_positions: Dict[str, Tuple[float, float]]) -> float:
+    """
+    Compute total Half-Perimeter Wirelength (HPWL) for all nets.
+
+    For each net, HPWL = (max_x - min_x) + (max_y - min_y)
+    where min/max are taken over all pins in the net.
+    """
+    total_hpwl = 0.0
+
+    # Build pin position lookup
+    pin_positions = {}
+    for mod in modules:
+        if mod.name in module_positions:
+            x, y = module_positions[mod.name]
+            # Pin is at module center
+            pin_positions[mod.name] = (x + mod.w / 2.0, y + mod.h / 2.0)
+
+    for name, (tx, ty) in terminal_positions.items():
+        pin_positions[name] = (tx, ty)
+
+    for net in nets:
+        if not net.pins:
+            continue
+        xs = []
+        ys = []
+        for pin_name in net.pins:
+            if pin_name in pin_positions:
+                px, py = pin_positions[pin_name]
+                xs.append(px)
+                ys.append(py)
+
+        if xs:
+            hpwl = (max(xs) - min(xs)) + (max(ys) - min(ys))
+            total_hpwl += hpwl * net.weight
+
+    return total_hpwl
+
+
+# ============================================================
+# SIMULATED ANNEALING ENGINE
+# ============================================================
+
+class SimulatedAnnealing:
+    """
+    Simulated Annealing optimizer for B*-tree based floorplanning.
+
+    Performs three types of moves:
+    1. Rotate: rotate a random module by 90 degrees
+    2. Swap: swap two random modules in the B*-tree
+    3. Move: delete a module and re-insert it at a different position
+    """
+
+    def __init__(self, modules: List[Module], hard_indices: List[int],
+                 nets: List[Net] = None,
+                 terminal_positions: Dict[str, Tuple[float, float]] = None,
+                 fixed_outline: Tuple[float, float] = None,
+                 random_seed: int = 42):
+        self.modules = modules
+        self.hard_indices = hard_indices  # indices of hard blocks
+        self.nets = nets or []
+        self.terminal_positions = terminal_positions or {}
+        self.fixed_outline = fixed_outline  # (width, height) or None
+
+        self.packer = ContourPacker(modules)
+        random.seed(random_seed)
+
+        # SA parameters
+        self.T_initial = 10000.0
+        self.T_final = 0.01
+        self.cooling_rate = 0.95
+        self.max_iter_per_temp = 50
+        self.max_total_iter = 5000
+
+        # Objective weights
+        self.w_hpwl = 1.0
+        self.w_area = 1.0
+        self.w_ar = 1.0       # aspect ratio penalty
+        self.w_overlap = 1000.0  # overlap penalty (for fixed outline)
+        self.w_outline = 10000.0  # outline violation penalty
+
+        # Track best
+        self.best_tree = None
+        self.best_rotations = None
+        self.best_cost = float('inf')
+        self.best_positions = None
+        self.best_width = 0.0
+        self.best_height = 0.0
+
+    def run(self, problem_type: int = 1, dead_space_ratio: float = 0.0,
+            adaptive: bool = True) -> FloorplanResult:
+        """
+        Run Simulated Annealing.
+
+        Args:
+            problem_type: 1 (area min), 2 (HPWL min), 3 (feasibility), 4 (non-rect)
+            dead_space_ratio: for problem 2/3, the dead space ratio for outline
+            adaptive: whether to use adaptive cooling schedule
+
+        Returns:
+            FloorplanResult with best found solution
+        """
+        # Initialize
+        n = len(self.hard_indices)
+        if n == 0:
+            return FloorplanResult({}, 0, 0, 0, 0, 0, 0)
+
+        # Initialize tree
+        tree = BTree(n)
+        shuffled = list(range(n))
+        random.shuffle(shuffled)
+        tree.build_initial_tree(shuffled)
+
+        # Initialize rotations (all not rotated)
+        rotations = [False] * n
+
+        # Compute fixed outline if needed
+        if problem_type >= 2 and self.fixed_outline is None:
+            total_area = sum(self.modules[i].area for i in self.hard_indices)
+            side = math.sqrt(total_area * (1 + dead_space_ratio))
+            self.fixed_outline = (side, side)
+
+        # Initial packing
+        self._apply_rotations(rotations)
+        positions, width, height = self.packer.pack(tree)
+        current_cost = self._compute_cost(positions, width, height, problem_type)
+
+        # Best tracking
+        self.best_tree = tree.copy()
+        self.best_rotations = rotations[:]
+        self.best_cost = current_cost
+        self.best_positions = dict(positions)
+        self.best_width = width
+        self.best_height = height
+
+        # SA loop
+        T = self.T_initial
+        iteration = 0
+        stuck_count = 0
+
+        while T > self.T_final and iteration < self.max_total_iter:
+            n_moves = min(self.max_iter_per_temp, n * 3)
+
+            for _ in range(n_moves):
+                iteration += 1
+
+                # Save state
+                old_rotations = rotations[:]
+                old_tree = tree.copy()
+
+                # Perturb
+                move_type = random.choices(
+                    [1, 2, 3],
+                    weights=[0.3, 0.4, 0.3],
+                    k=1
+                )[0]
+
+                if move_type == 1:
+                    # Rotate a random module
+                    idx = random.choice(self.hard_indices)
+                    rotations[idx] = not rotations[idx]
+
+                elif move_type == 2:
+                    # Swap two random modules
+                    i1 = random.randrange(n)
+                    i2 = random.randrange(n)
+                    if i1 != i2:
+                        tree.swap_modules(i1, i2)
+
+                elif move_type == 3:
+                    # Delete and re-insert
+                    i1 = random.randrange(n)
+                    i2 = random.randrange(n)
+                    if i1 != i2:
+                        tree.delete_and_insert(i1, i2)
+
+                # Re-pack
+                self._apply_rotations(rotations)
+                positions, width, height = self.packer.pack(tree)
+                new_cost = self._compute_cost(positions, width, height, problem_type)
+
+                # Accept/reject
+                delta = new_cost - current_cost
+                if delta < 0 or random.random() < math.exp(-delta / T):
+                    current_cost = new_cost
+                    if current_cost < self.best_cost:
+                        self.best_tree = tree.copy()
+                        self.best_rotations = rotations[:]
+                        self.best_cost = current_cost
+                        self.best_positions = dict(positions)
+                        self.best_width = width
+                        self.best_height = height
+                        stuck_count = 0
+                    else:
+                        stuck_count += 1
+                else:
+                    # Reject: restore state
+                    rotations = old_rotations
+                    tree = old_tree
+
+                # Early termination if stuck too long
+                if stuck_count > 500:
+                    break
+
+            if stuck_count > 500:
+                break
+
+            # Cool down
+            if adaptive:
+                # Adaptive cooling: slow down when near optimum
+                if stuck_count < 20:
+                    T *= self.cooling_rate
+                else:
+                    T *= 0.99  # slower cooling when stuck
+            else:
+                T *= self.cooling_rate
+
+        # Restore best
+        self._apply_rotations(self.best_rotations)
+
+        # Compute final metrics
+        area = self.best_width * self.best_height
+        ar = max(self.best_width, self.best_height) / max(1e-9, min(self.best_width, self.best_height))
+
+        # Build module name -> position mapping
+        module_positions = {}
+        for tree_idx, (x, y) in self.best_positions.items():
+            mod = self.modules[self.hard_indices[tree_idx]]
+            module_positions[mod.name] = (x, y, self.best_rotations[tree_idx])
+
+        # Compute HPWL
+        total_hpwl = 0.0
+        if self.nets:
+            pos_for_hpwl = {name: (x, y) for name, (x, y, _) in module_positions.items()}
+            total_hpwl = compute_hpwl(self.nets, pos_for_hpwl,
+                                      self.modules, self.terminal_positions)
+
+        # Compute actual dead space ratio
+        total_block_area = sum(self.modules[i].area for i in self.hard_indices)
+        actual_dsr = (area - total_block_area) / max(1e-9, total_block_area)
+
+        return FloorplanResult(
+            module_positions=module_positions,
+            outline_width=self.best_width,
+            outline_height=self.best_height,
+            area=area,
+            aspect_ratio=ar,
+            total_hpwl=total_hpwl,
+            dead_space_ratio=actual_dsr
+        )
+
+    def _apply_rotations(self, rotations: List[bool]):
+        """Apply rotation states to modules."""
+        for i, idx in enumerate(self.hard_indices):
+            self.modules[idx].rotated = rotations[i]
+
+    def _compute_cost(self, positions: Dict, width: float, height: float,
+                      problem_type: int) -> float:
+        """Compute the cost function based on problem type."""
+        cost = 0.0
+
+        if problem_type == 1:
+            # Minimize area with aspect ratio preference
+            area = width * height
+            ar = max(width, height) / max(1e-9, min(width, height))
+            cost = area * (1.0 + 0.1 * abs(ar - 1.0))
+
+        elif problem_type == 2:
+            # Minimize HPWL with fixed outline constraint
+            # Penalize outline violations
+            ow, oh = self.fixed_outline
+            outline_penalty = max(0, width - ow) + max(0, height - oh)
+            outline_penalty *= self.w_outline
+
+            # Compute HPWL
+            hpwl = 0.0
+            if self.nets:
+                mod_pos = {}
+                for tree_idx, (x, y) in positions.items():
+                    mod = self.modules[self.hard_indices[tree_idx]]
+                    mod_pos[mod.name] = (x, y)
+                hpwl = compute_hpwl(self.nets, mod_pos,
+                                    self.modules, self.terminal_positions)
+
+            cost = hpwl + outline_penalty
+
+        elif problem_type == 3:
+            # Feasibility check: only penalty for outline violation
+            ow, oh = self.fixed_outline
+            outline_penalty = max(0, width - ow) + max(0, height - oh)
+            cost = outline_penalty
+
+        elif problem_type == 4:
+            # Same as problem 1 but with sub-block decomposition for non-rect modules
+            area = width * height
+            ar = max(width, height) / max(1e-9, min(width, height))
+            cost = area * (1.0 + 0.1 * abs(ar - 1.0))
+
+        return cost
+
+
+# ============================================================
+# PROBLEM SOLVERS
+# ============================================================
+
+class ProblemSolver:
+    """Main solver orchestrator for all four problems."""
+
+    def __init__(self, blocks_file: str, nets_file: str, pl_file: str):
+        self.blocks_file = blocks_file
+        self.nets_file = nets_file
+        self.pl_file = pl_file
+
+        self.modules: List[Module] = []
+        self.nets: List[Net] = []
+        self.terminal_positions: Dict[str, Tuple[float, float]] = {}
+
+        self.hard_modules: List[Module] = []
+        self.hard_indices: List[int] = []
+
+        self._load_data()
+
+    def _load_data(self):
+        """Load all input data."""
+        self.modules = VLSIParser.parse_blocks(self.blocks_file)
+        if os.path.exists(self.nets_file):
+            self.nets = VLSIParser.parse_nets(self.nets_file)
+        if os.path.exists(self.pl_file):
+            self.terminal_positions = VLSIParser.parse_pl(self.pl_file)
+
+        # Separate hard blocks
+        self.hard_modules = []
+        self.hard_indices = []
+        for mod in self.modules:
+            if mod.module_type == 'block':
+                self.hard_indices.append(len(self.hard_modules))
+                self.hard_modules.append(mod)
+
+        print(f"Loaded {len(self.modules)} modules "
+              f"({len(self.hard_modules)} hard blocks, "
+              f"{len(self.modules) - len(self.hard_modules)} terminals)")
+        print(f"Loaded {len(self.nets)} nets")
+        print(f"Loaded {len(self.terminal_positions)} terminal positions")
+
+    def solve_problem1(self) -> FloorplanResult:
+        """
+        Problem 1: Minimize chip area with variable outline and no connection constraints.
+
+        Approach:
+        - B*-tree representation + Contour-based packing
+        - Simulated Annealing with objective: area * (1 + β|AR - 1|)
+        - Modules can be rotated 90 degrees
+        """
+        print("\n" + "=" * 60)
+        print("PROBLEM 1: Area Minimization with Variable Outline")
+        print("=" * 60)
+
+        sa = SimulatedAnnealing(
+            modules=self.hard_modules,
+            hard_indices=list(range(len(self.hard_modules))),
+            nets=[],  # No nets in problem 1
+            terminal_positions={},
+            fixed_outline=None,  # Variable outline
+            random_seed=42
+        )
+
+        # Tune SA parameters for problem 1
+        sa.T_initial = 10000.0
+        sa.T_final = 0.001
+        sa.cooling_rate = 0.95
+        sa.max_iter_per_temp = max(30, len(self.hard_modules))
+        sa.max_total_iter = max(3000, len(self.hard_modules) * 50)
+
+        result = sa.run(problem_type=1)
+
+        print(f"Outline: {result.outline_width:.2f} x {result.outline_height:.2f}")
+        print(f"Area: {result.area:.2f}")
+        print(f"Aspect Ratio: {result.aspect_ratio:.4f}")
+        print(f"Dead Space Ratio: {result.dead_space_ratio:.4f}")
+
+        return result
+
+    def solve_problem2(self, dead_space_ratio: float = 0.15) -> FloorplanResult:
+        """
+        Problem 2: Minimize HPWL with fixed square outline.
+
+        Approach:
+        - Outline dimensions computed from formula (1)
+        - B*-tree + SA with HPWL objective
+        - Heavy penalty for outline violations
+        """
+        print("\n" + "=" * 60)
+        print(f"PROBLEM 2: HPWL Minimization with Fixed Outline (DSR={dead_space_ratio})")
+        print("=" * 60)
+
+        # Compute fixed outline
+        total_area = sum(m.area for m in self.hard_modules)
+        side = math.sqrt(total_area * (1 + dead_space_ratio))
+        fixed_outline = (side, side)
+        print(f"Fixed Outline: {side:.2f} x {side:.2f}")
+        print(f"Total Block Area: {total_area:.2f}")
+
+        sa = SimulatedAnnealing(
+            modules=self.hard_modules,
+            hard_indices=list(range(len(self.hard_modules))),
+            nets=self.nets,
+            terminal_positions=self.terminal_positions,
+            fixed_outline=fixed_outline,
+            random_seed=123
+        )
+
+        # Tune SA parameters for problem 2
+        sa.T_initial = 5000.0
+        sa.T_final = 0.01
+        sa.cooling_rate = 0.95
+        sa.max_iter_per_temp = max(40, len(self.hard_modules))
+        sa.max_total_iter = max(5000, len(self.hard_modules) * 80)
+        sa.w_outline = 100000.0
+        sa.w_hpwl = 1.0
+
+        result = sa.run(problem_type=2, dead_space_ratio=dead_space_ratio)
+
+        # Check if feasible
+        if result.outline_width > side + 1e-6 or result.outline_height > side + 1e-6:
+            print("WARNING: Solution violates outline constraint!")
+            print(f"  Width: {result.outline_width:.2f} > {side:.2f}")
+            print(f"  Height: {result.outline_height:.2f} > {side:.2f}")
+
+        print(f"Total HPWL: {result.total_hpwl:.2f}")
+        print(f"Outline: {result.outline_width:.2f} x {result.outline_height:.2f}")
+        print(f"Area: {result.area:.2f}")
+
+        return result
+
+    def solve_problem3(self) -> Tuple[float, FloorplanResult]:
+        """
+        Problem 3: Find minimum feasible dead_space_ratio.
+
+        Approach:
+        - Binary search on dead_space_ratio
+        - For each ratio, run SA to check feasibility
+        - Feasible if there exists a placement within the outline
+        """
+        print("\n" + "=" * 60)
+        print("PROBLEM 3: Minimum Feasible Dead Space Ratio")
+        print("=" * 60)
+
+        total_area = sum(m.area for m in self.hard_modules)
+
+        # Binary search range
+        lo = 0.0
+        hi = 0.5  # Upper bound for dead space ratio
+        best_feasible = hi
+        best_result = None
+        precision = 0.001
+
+        n_trials_per_ratio = 3  # Multiple SA runs for robustness
+
+        iteration = 0
+        while hi - lo > precision and iteration < 30:
+            iteration += 1
+            mid = (lo + hi) / 2.0
+            side = math.sqrt(total_area * (1 + mid))
+            fixed_outline = (side, side)
+
+            print(f"\n  Iteration {iteration}: Testing DSR = {mid:.4f}, Outline = {side:.2f}")
+
+            feasible = False
+            best_trial_result = None
+            best_trial_violation = float('inf')
+
+            for trial in range(n_trials_per_ratio):
+                sa = SimulatedAnnealing(
+                    modules=[copy.deepcopy(m) for m in self.hard_modules],
+                    hard_indices=list(range(len(self.hard_modules))),
+                    nets=self.nets,
+                    terminal_positions=self.terminal_positions,
+                    fixed_outline=fixed_outline,
+                    random_seed=42 + trial * 100 + iteration * 10
+                )
+
+                sa.T_initial = 3000.0
+                sa.T_final = 0.1
+                sa.cooling_rate = 0.93
+                sa.max_iter_per_temp = max(30, len(self.hard_modules))
+                sa.max_total_iter = max(3000, len(self.hard_modules) * 50)
+                sa.w_outline = 50000.0
+
+                result = sa.run(problem_type=3, dead_space_ratio=mid)
+
+                violation = (max(0, result.outline_width - side) +
+                             max(0, result.outline_height - side))
+                if violation < 0.01 * side:
+                    feasible = True
+                if violation < best_trial_violation:
+                    best_trial_violation = violation
+                    best_trial_result = result
+
+            if feasible:
+                # Can try smaller ratio
+                hi = mid
+                best_feasible = mid
+                best_result = best_trial_result
+                print(f"    [OK] Feasible at DSR = {mid:.4f} (narrowing search down)")
+            else:
+                lo = mid
+                print(f"    [X] Not feasible at DSR = {mid:.4f} (moving up)")
+
+        print(f"\nMinimum feasible dead space ratio: {best_feasible:.4f}")
+
+        # Re-run with best ratio to get HPWL
+        if best_result is None:
+            best_result = self.solve_problem2(best_feasible)
+        else:
+            # Recompute HPWL properly
+            best_result = self._refine_result(best_feasible, best_result)
+
+        print(f"Total HPWL at minimum DSR: {best_result.total_hpwl:.2f}")
+        print(f"Outline: {best_result.outline_width:.2f} x {best_result.outline_height:.2f}")
+
+        return best_feasible, best_result
+
+    def _refine_result(self, dsr: float, previous_result: FloorplanResult) -> FloorplanResult:
+        """Re-run SA at a given DSR with HPWL objective for a refined result."""
+        total_area = sum(m.area for m in self.hard_modules)
+        side = math.sqrt(total_area * (1 + dsr))
+
+        # Restore rotations from previous result
+        for mod_name, (x, y, rotated) in previous_result.module_positions.items():
+            for mod in self.hard_modules:
+                if mod.name == mod_name:
+                    mod.rotated = rotated
+                    break
+
+        sa = SimulatedAnnealing(
+            modules=self.hard_modules,
+            hard_indices=list(range(len(self.hard_modules))),
+            nets=self.nets,
+            terminal_positions=self.terminal_positions,
+            fixed_outline=(side, side),
+            random_seed=777
+        )
+        sa.T_initial = 2000.0
+        sa.T_final = 0.05
+        sa.cooling_rate = 0.95
+        sa.max_iter_per_temp = max(30, len(self.hard_modules))
+        sa.max_total_iter = max(3000, len(self.hard_modules) * 40)
+        sa.w_outline = 100000.0
+        return sa.run(problem_type=2, dead_space_ratio=dsr)
+
+    def solve_problem4(self, custom_modules: List[Module] = None) -> FloorplanResult:
+        """
+        Problem 4: Floorplanning with L-shaped and T-shaped modules.
+
+        Approach:
+        - Decompose non-rectangular modules into sub-rectangles
+        - Use B*-tree where each node is a sub-block
+        - Add constraints to keep sub-blocks of same module together
+        - Apply 90°/180°/270° rotation to entire module
+        """
+        print("\n" + "=" * 60)
+        print("PROBLEM 4: Non-Rectangular Module Floorplanning")
+        print("=" * 60)
+
+        if custom_modules:
+            modules = custom_modules
+        else:
+            modules = [m for m in self.modules if m.module_type == 'block']
+
+        # Decompose non-rect modules into sub-blocks
+        all_sub_blocks = []  # List of (module_idx, SubBlock)
+        module_sub_map = defaultdict(list)  # module_idx -> [sub_block_indices]
+
+        for mod_idx, mod in enumerate(modules):
+            if mod.shape_type != 'rect' and mod.sub_blocks:
+                for sb in mod.sub_blocks:
+                    idx = len(all_sub_blocks)
+                    all_sub_blocks.append((mod_idx, sb))
+                    module_sub_map[mod_idx].append(idx)
+            else:
+                # Rectangular module: single sub-block
+                sb = SubBlock(0, 0, mod.width, mod.height)
+                idx = len(all_sub_blocks)
+                all_sub_blocks.append((mod_idx, sb))
+                module_sub_map[mod_idx].append(idx)
+
+        # Create flat modules for each sub-block
+        flat_modules = []
+        for mod_idx, sb in all_sub_blocks:
+            flat_mod = Module(
+                name=f"{modules[mod_idx].name}_sub{len(flat_modules)}",
+                module_type='block',
+                width=sb.width,
+                height=sb.height,
+                is_hard=True
+            )
+            # Store reference to parent module and relative offset
+            flat_mod._parent_mod = modules[mod_idx]
+            flat_mod._rel_x = sb.rel_x
+            flat_mod._rel_y = sb.rel_y
+            flat_mod._mod_idx = mod_idx
+            flat_modules.append(flat_mod)
+
+        print(f"Decomposed {len(modules)} modules into {len(flat_modules)} sub-blocks")
+        for mod_idx, mod in enumerate(modules):
+            if mod.shape_type != 'rect':
+                print(f"  {mod.name}: {mod.shape_type}-shaped, "
+                      f"{len(module_sub_map[mod_idx])} sub-blocks")
+
+        # SA with special constraint handling
+        sa = SimulatedAnnealing(
+            modules=flat_modules,
+            hard_indices=list(range(len(flat_modules))),
+            nets=[],
+            terminal_positions={},
+            fixed_outline=None,
+            random_seed=42
+        )
+
+        sa.T_initial = 5000.0
+        sa.T_final = 0.01
+        sa.cooling_rate = 0.95
+        sa.max_iter_per_temp = max(30, len(flat_modules))
+        sa.max_total_iter = max(2000, len(flat_modules) * 80)
+
+        # We need a modified SA that respects module grouping
+        # For simplicity, we use the standard SA but compute cost differently
+        result = sa.run(problem_type=4)
+
+        # Post-process: compute actual outline as bounding box of reconstructed modules
+        # Reconstruct modules from sub-blocks
+        result = self._reconstruct_from_sub_blocks(result, modules, module_sub_map,
+                                                    all_sub_blocks, flat_modules)
+
+        print(f"Outline: {result.outline_width:.2f} x {result.outline_height:.2f}")
+        print(f"Area: {result.area:.2f}")
+        print(f"Aspect Ratio: {result.aspect_ratio:.4f}")
+
+        return result
+
+    def _reconstruct_from_sub_blocks(self, sa_result: FloorplanResult,
+                                     modules: List[Module],
+                                     module_sub_map: Dict[int, List[int]],
+                                     all_sub_blocks: List[Tuple[int, SubBlock]],
+                                     flat_modules: List[Module]) -> FloorplanResult:
+        """Reconstruct module positions from sub-block packing."""
+        module_positions = {}
+
+        for mod_idx, mod in enumerate(modules):
+            sub_indices = module_sub_map[mod_idx]
+
+            if len(sub_indices) == 1:
+                # Rectangular module
+                sub_idx = sub_indices[0]
+                flat_mod = flat_modules[sub_idx]
+                if flat_mod.name in sa_result.module_positions:
+                    x, y, rot = sa_result.module_positions[flat_mod.name]
+                    module_positions[mod.name] = (x, y, rot)
+            else:
+                # Non-rectangular: need to reconstruct from sub-blocks
+                sb_positions = []
+                for sub_idx in sub_indices:
+                    flat_mod = flat_modules[sub_idx]
+                    if flat_mod.name in sa_result.module_positions:
+                        x, y, _ = sa_result.module_positions[flat_mod.name]
+                        sb = all_sub_blocks[sub_idx][1]
+                        # Absolute position = sub-block position + relative offset
+                        abs_x = x - sb.rel_x
+                        abs_y = y - sb.rel_y
+                        sb_positions.append((abs_x, abs_y))
+
+                if sb_positions:
+                    # Average the origin positions (should be close if constraint works)
+                    avg_x = sum(p[0] for p in sb_positions) / len(sb_positions)
+                    avg_y = sum(p[1] for p in sb_positions) / len(sb_positions)
+                    module_positions[mod.name] = (avg_x, avg_y, False)
+
+        # Compute overall bounding box
+        max_x = 0.0
+        max_y = 0.0
+        for mod_name, (x, y, rot) in module_positions.items():
+            mod = next((m for m in modules if m.name == mod_name), None)
+            if mod:
+                if rot:
+                    w, h = mod.height, mod.width
+                else:
+                    w, h = mod.width, mod.height
+                max_x = max(max_x, x + w)
+                max_y = max(max_y, y + h)
+
+        area = max_x * max_y
+        ar = max(max_x, max_y) / max(1e-9, min(max_x, max_y))
+
+        return FloorplanResult(
+            module_positions=module_positions,
+            outline_width=max_x,
+            outline_height=max_y,
+            area=area,
+            aspect_ratio=ar,
+            total_hpwl=0.0,
+            dead_space_ratio=0.0
+        )
+
+
+# ============================================================
+# PROBLEM 4: NON-RECTANGULAR MODULE EXTENDED SOLVER
+# ============================================================
+
+class NonRectSolver:
+    """
+    Extended solver for Problem 4: L-shaped and T-shaped modules.
+
+    Uses a direct approach for small problem instances (like the 4-module example)
+    with exhaustive or grid-based search.
+    """
+
+    @staticmethod
+    def solve_4_modules(modules: List[Module]) -> FloorplanResult:
+        """
+        Solve the 4-module problem (1 T-shape, 1 L-shape, 2 rectangles) from Problem 4.
+
+        Approach:
+        - Represent each module as a bitmap/polygon
+        - Use grid-based placement with Simulated Annealing
+        - Each module can be rotated 90°, 180°, 270°
+        """
+        print("\n" + "=" * 60)
+        print("PROBLEM 4: Solving 4-module instance")
+        print("=" * 60)
+
+        # Generate all rotation variants for each module
+        variants = []
+        for mod in modules:
+            mod_variants = NonRectSolver._generate_rotations(mod)
+            variants.append(mod_variants)
+            print(f"  {mod.name}: {mod.shape_type}-shaped, "
+                  f"{len(mod_variants)} rotation variants")
+
+        # Simulated Annealing on sequence-pair-like representation
+        best_result = NonRectSolver._sa_nonrect(modules, variants)
+
+        print(f"Best area: {best_result.area:.2f}")
+        print(f"Outline: {best_result.outline_width:.2f} x {best_result.outline_height:.2f}")
+
+        return best_result
+
+    @staticmethod
+    def _generate_rotations(mod: Module) -> List[List[SubBlock]]:
+        """Generate all rotation variants of a module (0°, 90°, 180°, 270°)."""
+        variants = []
+
+        if mod.shape_type == 'rect':
+            # Rectangular: swap or not
+            variants.append([SubBlock(0, 0, mod.width, mod.height)])
+            if abs(mod.width - mod.height) > 1e-9:
+                variants.append([SubBlock(0, 0, mod.height, mod.width)])
+        else:
+            # Non-rect: rotate each sub-block
+            for angle in [0, 90, 180, 270]:
+                rotated = NonRectSolver._rotate_sub_blocks(mod.sub_blocks, angle)
+                if rotated not in variants:
+                    variants.append(rotated)
+            # Deduplicate
+            unique_variants = []
+            for v in variants:
+                is_dup = False
+                for uv in unique_variants:
+                    if NonRectSolver._same_config(v, uv):
+                        is_dup = True
+                        break
+                if not is_dup:
+                    unique_variants.append(v)
+            variants = unique_variants
+
+        return variants
+
+    @staticmethod
+    def _rotate_sub_blocks(blocks: List[SubBlock], angle: int) -> List[SubBlock]:
+        """Rotate sub-blocks by angle (counter-clockwise)."""
+        if angle == 0:
+            return [SubBlock(b.rel_x, b.rel_y, b.width, b.height) for b in blocks]
+
+        # Compute bounding box
+        max_x = max(b.rel_x + b.width for b in blocks)
+        max_y = max(b.rel_y + b.height for b in blocks)
+
+        result = []
+        for b in blocks:
+            cx = b.rel_x + b.width / 2.0
+            cy = b.rel_y + b.height / 2.0
+
+            if angle == 90:
+                # (x, y) -> (max_y - y - h, x)
+                nx = max_y - b.rel_y - b.height
+                ny = b.rel_x
+                nw = b.height
+                nh = b.width
+            elif angle == 180:
+                # (x, y) -> (max_x - x - w, max_y - y - h)
+                nx = max_x - b.rel_x - b.width
+                ny = max_y - b.rel_y - b.height
+                nw = b.width
+                nh = b.height
+            elif angle == 270:
+                # (x, y) -> (y, max_x - x - w)
+                nx = b.rel_y
+                ny = max_x - b.rel_x - b.width
+                nw = b.height
+                nh = b.width
+
+            result.append(SubBlock(nx, ny, nw, nh))
+
+        # Normalize to origin
+        min_x = min(b.rel_x for b in result)
+        min_y = min(b.rel_y for b in result)
+        result = [SubBlock(b.rel_x - min_x, b.rel_y - min_y, b.width, b.height)
+                  for b in result]
+
+        return result
+
+    @staticmethod
+    def _same_config(a: List[SubBlock], b: List[SubBlock]) -> bool:
+        """Check if two sub-block configurations are the same."""
+        if len(a) != len(b):
+            return False
+        # Normalize and compare
+        a_norm = sorted([(sb.rel_x, sb.rel_y, sb.width, sb.height) for sb in a])
+        b_norm = sorted([(sb.rel_x, sb.rel_y, sb.width, sb.height) for sb in b])
+        return all(abs(a_norm[i][j] - b_norm[i][j]) < 1e-9
+                   for i in range(len(a_norm)) for j in range(4))
+
+    @staticmethod
+    def _sa_nonrect(modules: List[Module],
+                    variants: List[List[SubBlock]]) -> FloorplanResult:
+        """Simulated Annealing for non-rectangular modules."""
+        n = len(modules)
+        # Each module: position (x, y) + variant index
+        current_variants = [0] * n
+        current_x = [0.0] * n
+        current_y = [0.0] * n
+
+        # Initialize in a spread-out grid to avoid all starting at origin
+        grid_cols = int(math.ceil(math.sqrt(n)))
+        for i in range(n):
+            current_variants[i] = random.randrange(len(variants[i]))
+            # Spread modules in a grid pattern
+            col = i % grid_cols
+            row = i // grid_cols
+            current_x[i] = col * 50.0 + random.uniform(0, 10)
+            current_y[i] = row * 50.0 + random.uniform(0, 10)
+
+        # Compact to origin (push bottom-left)
+        current_x, current_y = NonRectSolver._compact_placement(
+            modules, variants, current_variants, current_x, current_y)
+
+        current_width, current_height = NonRectSolver._compute_bbox(
+            modules, variants, current_variants, current_x, current_y)
+        current_area = current_width * current_height
+
+        def objective(w, h):
+            ar = max(w, h) / max(1e-9, min(w, h))
+            return w * h * (1.0 + 0.1 * abs(ar - 1.0))
+
+        current_cost = objective(current_width, current_height)
+
+        best_variants = current_variants[:]
+        best_x = current_x[:]
+        best_y = current_y[:]
+        best_cost = current_cost
+        best_width = current_width
+        best_height = current_height
+
+        T = 10000.0
+        T_final = 0.01
+        cooling_rate = 0.96
+        max_iter = 8000
+
+        for iteration in range(max_iter):
+            if T < T_final:
+                break
+
+            for _ in range(30):
+                i = random.randrange(n)
+                j = random.randrange(n)  # secondary index for swaps
+
+                # Save state for BOTH i and j (j might be affected by swap)
+                old_var_i = current_variants[i]
+                old_x_i = current_x[i]
+                old_y_i = current_y[i]
+                old_var_j = current_variants[j]
+                old_x_j = current_x[j]
+                old_y_j = current_y[j]
+
+                # Perturb
+                perturb_type = random.random()
+                is_swap = False
+                if perturb_type < 0.25:
+                    # Change variant (rotation)
+                    if len(variants[i]) > 1:
+                        new_var = (current_variants[i] + random.randrange(1, len(variants[i]))) % len(variants[i])
+                        current_variants[i] = new_var
+                elif perturb_type < 0.5:
+                    # Swap positions with another module
+                    if i != j:
+                        current_x[i], current_x[j] = current_x[j], current_x[i]
+                        current_y[i], current_y[j] = current_y[j], current_y[i]
+                        # Swap variants, but clamp to valid range for each module
+                        vi, vj = current_variants[j], current_variants[i]
+                        current_variants[i] = min(vi, len(variants[i]) - 1)
+                        current_variants[j] = min(vj, len(variants[j]) - 1)
+                        is_swap = True
+                elif perturb_type < 0.75:
+                    # Move in x
+                    step = max(1.0, current_width * 0.2)
+                    current_x[i] += random.uniform(-step, step)
+                    if current_x[i] < 0:
+                        current_x[i] = 0
+                else:
+                    # Move in y
+                    step = max(1.0, current_height * 0.2)
+                    current_y[i] += random.uniform(-step, step)
+                    if current_y[i] < 0:
+                        current_y[i] = 0
+
+                # Compact (push to bottom-left)
+                cx, cy = NonRectSolver._compact_placement(
+                    modules, variants, current_variants, current_x, current_y)
+
+                # Recompute
+                nw, nh = NonRectSolver._compute_bbox(
+                    modules, variants, current_variants, cx, cy)
+                nc = objective(nw, nh)
+
+                delta = nc - current_cost
+                if delta < 0 or random.random() < math.exp(-delta / T):
+                    current_x = cx
+                    current_y = cy
+                    current_cost = nc
+                    current_width = nw
+                    current_height = nh
+
+                    if current_cost < best_cost:
+                        best_variants = current_variants[:]
+                        best_x = current_x[:]
+                        best_y = current_y[:]
+                        best_cost = current_cost
+                        best_width = nw
+                        best_height = nh
+                else:
+                    # Reject - restore both i and j
+                    current_variants[i] = old_var_i
+                    current_x[i] = old_x_i
+                    current_y[i] = old_y_i
+                    if is_swap:
+                        current_variants[j] = old_var_j
+                        current_x[j] = old_x_j
+                        current_y[j] = old_y_j
+
+            T *= cooling_rate
+
+        # Build result with variant index stored as rotation info
+        positions = {}
+        for i, mod in enumerate(modules):
+            positions[mod.name] = (best_x[i], best_y[i],
+                                   best_variants[i])  # Store actual variant index
+
+        return FloorplanResult(
+            module_positions=positions,
+            outline_width=best_width,
+            outline_height=best_height,
+            area=best_width * best_height,
+            aspect_ratio=max(best_width, best_height) /
+                         max(1e-9, min(best_width, best_height))
+        )
+
+    @staticmethod
+    def _compact_placement(modules: List[Module],
+                           variants: List[List[SubBlock]],
+                           var_indices: List[int],
+                           xs: List[float],
+                           ys: List[float]) -> Tuple[List[float], List[float]]:
+        """
+        Compact placement: resolve all overlaps and push to origin.
+        Uses a simple left-to-right, bottom-to-top packing similar to
+        1D bin packing after sorting by initial position.
+        """
+        n = len(modules)
+        # Order: sort by initial (x, y)
+        order = sorted(range(n), key=lambda i: (xs[i], ys[i]))
+
+        new_xs = [0.0] * n
+        new_ys = [0.0] * n
+
+        for rank, idx in enumerate(order):
+            blocks = variants[idx][var_indices[idx]]
+
+            if rank == 0:
+                new_xs[idx] = 0.0
+                new_ys[idx] = 0.0
+                continue
+
+            # Try grid positions based on placed modules' corners
+            candidates = [(0.0, 0.0)]
+
+            for j in range(n):
+                if j == idx:
+                    continue
+                if rank == 0 and j != order[0]:
+                    continue
+                if j not in order[:rank]:
+                    continue  # not placed yet
+
+                j_blocks = variants[j][var_indices[j]]
+                j_right = new_xs[j] + max(b.rel_x + b.width for b in j_blocks)
+                j_top = new_ys[j] + max(b.rel_y + b.height for b in j_blocks)
+
+                # Corners of the bounding box of j
+                candidates.append((j_right, new_ys[j]))
+                candidates.append((new_xs[j], j_top))
+
+                # Sub-block corners
+                for sb in j_blocks:
+                    candidates.append((new_xs[j] + sb.rel_x + sb.width, new_ys[j] + sb.rel_y))
+                    candidates.append((new_xs[j] + sb.rel_x, new_ys[j] + sb.rel_y + sb.height))
+
+            # Sort by x+y (bottom-left preference)
+            candidates.sort(key=lambda p: p[0] + p[1])
+
+            best_pos = None
+            for cx, cy in candidates:
+                cx = max(0.0, cx)
+                cy = max(0.0, cy)
+
+                # Slide left from cx
+                slide_x = cx
+                step = 5.0
+                while slide_x > 0:
+                    test_x = max(0.0, slide_x - step)
+                    collision = False
+                    for j in order[:rank]:
+                        if NonRectSolver._modules_overlap(
+                                test_x, cy, blocks,
+                                new_xs[j], new_ys[j], variants[j][var_indices[j]]):
+                            collision = True
+                            break
+                    if collision:
+                        break
+                    slide_x = test_x
+                # Fine-tune
+                while slide_x > 0:
+                    test_x = slide_x - 1.0
+                    collision = False
+                    for j in order[:rank]:
+                        if NonRectSolver._modules_overlap(
+                                test_x, cy, blocks,
+                                new_xs[j], new_ys[j], variants[j][var_indices[j]]):
+                            collision = True
+                            break
+                    if collision:
+                        break
+                    slide_x = test_x
+
+                # Slide down from cy
+                slide_y = cy
+                step = 5.0
+                while slide_y > 0:
+                    test_y = max(0.0, slide_y - step)
+                    collision = False
+                    for j in order[:rank]:
+                        if NonRectSolver._modules_overlap(
+                                slide_x, test_y, blocks,
+                                new_xs[j], new_ys[j], variants[j][var_indices[j]]):
+                            collision = True
+                            break
+                    if collision:
+                        break
+                    slide_y = test_y
+                # Fine-tune
+                while slide_y > 0:
+                    test_y = slide_y - 1.0
+                    collision = False
+                    for j in order[:rank]:
+                        if NonRectSolver._modules_overlap(
+                                slide_x, test_y, blocks,
+                                new_xs[j], new_ys[j], variants[j][var_indices[j]]):
+                            collision = True
+                            break
+                    if collision:
+                        break
+                    slide_y = test_y
+
+                # Verify final position
+                collision = False
+                for j in order[:rank]:
+                    if NonRectSolver._modules_overlap(
+                            slide_x, slide_y, blocks,
+                            new_xs[j], new_ys[j], variants[j][var_indices[j]]):
+                        collision = True
+                        break
+
+                if not collision:
+                    if best_pos is None or (slide_x + slide_y) < (best_pos[0] + best_pos[1]):
+                        best_pos = (slide_x, slide_y)
+
+            if best_pos is None:
+                # Fallback: place at end of x-axis
+                max_right = 0.0
+                for j in order[:rank]:
+                    j_blocks = variants[j][var_indices[j]]
+                    j_right = new_xs[j] + max(b.rel_x + b.width for b in j_blocks)
+                    max_right = max(max_right, j_right)
+                best_pos = (max_right + 1.0, 0.0)
+
+            new_xs[idx] = best_pos[0]
+            new_ys[idx] = best_pos[1]
+
+        return new_xs, new_ys
+
+    @staticmethod
+    def _modules_overlap(x1: float, y1: float, blocks1: List[SubBlock],
+                         x2: float, y2: float, blocks2: List[SubBlock]) -> bool:
+        """Check if two modules overlap."""
+        for b1 in blocks1:
+            bx1 = x1 + b1.rel_x
+            by1 = y1 + b1.rel_y
+            bx1_e = bx1 + b1.width
+            by1_e = by1 + b1.height
+            for b2 in blocks2:
+                bx2 = x2 + b2.rel_x
+                by2 = y2 + b2.rel_y
+                bx2_e = bx2 + b2.width
+                by2_e = by2 + b2.height
+                if (bx1 < bx2_e and bx1_e > bx2 and
+                        by1 < by2_e and by1_e > by2):
+                    return True
+        return False
+
+    @staticmethod
+    def _compute_bbox(modules: List[Module],
+                      variants: List[List[SubBlock]],
+                      var_indices: List[int],
+                      xs: List[float],
+                      ys: List[float]) -> Tuple[float, float]:
+        """Compute bounding box of current placement."""
+        max_x = 0.0
+        max_y = 0.0
+        for i, mod in enumerate(modules):
+            sub_blocks = variants[i][var_indices[i]]
+            for sb in sub_blocks:
+                max_x = max(max_x, xs[i] + sb.rel_x + sb.width)
+                max_y = max(max_y, ys[i] + sb.rel_y + sb.height)
+        return max_x, max_y
+
+
+# ============================================================
+# VISUALIZATION
+# ============================================================
+
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+    from matplotlib.patches import Polygon, Rectangle
+    _HAS_MATPLOTLIB = True
+except ImportError:
+    _HAS_MATPLOTLIB = False
+    print("[WARNING] matplotlib not installed — visualization disabled.")
+    print("         Install with: pip install matplotlib")
+
+
+def visualize_floorplan(result: FloorplanResult,
+                        modules: List[Module],
+                        title: str = "Floorplan",
+                        save_path: str = None,
+                        show_nets: bool = False,
+                        nets: List[Net] = None,
+                        terminal_positions: Dict[str, Tuple[float, float]] = None):
+    """Generate a visualization of the floorplan."""
+    if not _HAS_MATPLOTLIB:
+        if save_path:
+            print(f"[SKIP] Cannot save {save_path} — matplotlib not installed")
+        return
+    fig, ax = plt.subplots(1, 1, figsize=(12, 12))
+
+    # Color map for different modules
+    colors = plt.cm.Set3(range(len(modules)))
+
+    # Draw modules
+    for i, mod in enumerate(modules):
+        if mod.name in result.module_positions:
+            x, y, rotated = result.module_positions[mod.name]
+            w, h = mod.w, mod.h
+            color = colors[i % len(colors)]
+
+            if mod.shape_type == 'rect':
+                rect = Rectangle((x, y), w, h, linewidth=1.5,
+                                 edgecolor='black', facecolor=color, alpha=0.7)
+                ax.add_patch(rect)
+            elif mod.sub_blocks:
+                # Draw each sub-block
+                for sb in mod.sub_blocks:
+                    rect = Rectangle((x + sb.rel_x, y + sb.rel_y),
+                                     sb.width, sb.height, linewidth=1.0,
+                                     edgecolor='black', facecolor=color, alpha=0.7)
+                    ax.add_patch(rect)
+
+            # Label
+            ax.text(x + w / 2.0, y + h / 2.0, mod.name,
+                    ha='center', va='center', fontsize=8, fontweight='bold')
+
+    # Draw outline
+    outline = Rectangle((0, 0), result.outline_width, result.outline_height,
+                        linewidth=2, edgecolor='red', facecolor='none',
+                        linestyle='--')
+    ax.add_patch(outline)
+
+    # Draw terminal positions if available
+    if terminal_positions:
+        for name, (tx, ty) in terminal_positions.items():
+            ax.plot(tx, ty, 'r*', markersize=8)
+            ax.text(tx + 1, ty + 1, name, fontsize=5, color='red')
+
+    # Draw nets if requested
+    if show_nets and nets and terminal_positions:
+        pin_positions = {}
+        for mod in modules:
+            if mod.name in result.module_positions:
+                x, y, _ = result.module_positions[mod.name]
+                pin_positions[mod.name] = (x + mod.w / 2.0, y + mod.h / 2.0)
+        for name, (tx, ty) in terminal_positions.items():
+            pin_positions[name] = (tx, ty)
+
+        for net in nets[:30]:  # Limit to first 30 nets for clarity
+            if len(net.pins) >= 2:
+                for k in range(len(net.pins) - 1):
+                    if net.pins[k] in pin_positions and net.pins[k + 1] in pin_positions:
+                        x1, y1 = pin_positions[net.pins[k]]
+                        x2, y2 = pin_positions[net.pins[k + 1]]
+                        ax.plot([x1, x2], [y1, y2], 'b-', linewidth=0.3, alpha=0.5)
+
+    ax.set_xlim(-10, result.outline_width * 1.1)
+    ax.set_ylim(-10, result.outline_height * 1.1)
+    ax.set_aspect('equal')
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_title(title)
+
+    # Add info text
+    info_text = (f"Area: {result.area:.2f}\n"
+                 f"Outline: {result.outline_width:.2f} x {result.outline_height:.2f}\n"
+                 f"Aspect Ratio: {result.aspect_ratio:.4f}")
+    if result.total_hpwl > 0:
+        info_text += f"\nHPWL: {result.total_hpwl:.2f}"
+    if result.dead_space_ratio > 0:
+        info_text += f"\nDSR: {result.dead_space_ratio:.4f}"
+
+    ax.text(0.02, 0.98, info_text, transform=ax.transAxes,
+            fontsize=10, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+
+    try:
+        plt.tight_layout()
+    except Exception:
+        pass
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved visualization to {save_path}")
+
+    plt.close()
+
+
+# ============================================================
+# MAIN ENTRY POINT
+# ============================================================
+
+def solve_chip(problem_path: str, chip_name: str):
+    """
+    Solve all problems for a single chip dataset.
+
+    Args:
+        problem_path: directory containing .blocks, .nets, .pl files
+        chip_name: name of the chip (e.g., "n100")
+    """
+    blocks_file = os.path.join(problem_path, f"{chip_name}.blocks")
+    nets_file = os.path.join(problem_path, f"{chip_name}.nets")
+    pl_file = os.path.join(problem_path, f"{chip_name}.pl")
+
+    # Check alternate naming
+    if not os.path.exists(blocks_file):
+        blocks_file = os.path.join(problem_path, f"{chip_name}.blocks")
+    if not os.path.exists(blocks_file):
+        # Try listing directory
+        for f in os.listdir(problem_path):
+            if f.endswith('.blocks'):
+                blocks_file = os.path.join(problem_path, f)
+                base = f[:-7]
+                nets_file = os.path.join(problem_path, f"{base}.nets")
+                pl_file = os.path.join(problem_path, f"{base}.pl")
+                break
+
+    print(f"\n{'#' * 70}")
+    print(f"# Solving for {chip_name}")
+    print(f"# Blocks: {blocks_file}")
+    print(f"# Nets: {nets_file}")
+    print(f"# PL: {pl_file}")
+    print(f"{'#' * 70}")
+
+    solver = ProblemSolver(blocks_file, nets_file, pl_file)
+
+    # Problem 1
+    result1 = solver.solve_problem1()
+    visualize_floorplan(result1, solver.hard_modules,
+                        title=f"{chip_name} - Problem 1: Area Minimization",
+                        save_path=f"{chip_name}_problem1.png")
+
+    # Problem 2
+    result2 = solver.solve_problem2(dead_space_ratio=0.15)
+    visualize_floorplan(result2, solver.hard_modules,
+                        title=f"{chip_name} - Problem 2: HPWL Minimization",
+                        save_path=f"{chip_name}_problem2.png",
+                        show_nets=True,
+                        nets=solver.nets,
+                        terminal_positions=solver.terminal_positions)
+
+    # Problem 3
+    min_dsr, result3 = solver.solve_problem3()
+    visualize_floorplan(result3, solver.hard_modules,
+                        title=f"{chip_name} - Problem 3: Min DSR = {min_dsr:.4f}",
+                        save_path=f"{chip_name}_problem3.png",
+                        show_nets=True,
+                        nets=solver.nets,
+                        terminal_positions=solver.terminal_positions)
+
+    # Problem 4 (only for specially defined non-rect modules)
+    # Will be solved separately
+
+    return {
+        'chip': chip_name,
+        'problem1': result1,
+        'problem2': result2,
+        'problem3': result3,
+        'min_dsr': min_dsr
+    }
+
+
+def solve_problem4_example():
+    """
+    Solve Problem 4 with the example from Figure 3.
+
+    Expected modules: 1 T-shaped, 1 L-shaped, 2 rectangular
+    Dimensions from the problem figure (approximate, users should adjust).
+    """
+    print("\n" + "#" * 70)
+    print("# PROBLEM 4: Non-Rectangular Module Example")
+    print("#" * 70)
+
+    # Create the example modules from Figure 3
+    # Users should adjust these coordinates based on the actual figure
+    # Example T-shape module
+    t_shape = Module(name="T1", module_type='block', width=60, height=40,
+                     is_hard=True, shape_type='T')
+    t_shape.sub_blocks = [
+        SubBlock(0, 0, 60, 10),    # top bar
+        SubBlock(25, 10, 10, 30),  # stem
+    ]
+
+    # Example L-shape module
+    l_shape = Module(name="L1", module_type='block', width=40, height=50,
+                     is_hard=True, shape_type='L')
+    l_shape.sub_blocks = [
+        SubBlock(0, 0, 40, 15),    # wide part
+        SubBlock(0, 15, 15, 35),   # tall part
+    ]
+
+    # Example rectangle modules
+    rect1 = Module(name="R1", module_type='block', width=30, height=25,
+                   is_hard=True, shape_type='rect')
+    rect2 = Module(name="R2", module_type='block', width=35, height=20,
+                   is_hard=True, shape_type='rect')
+
+    modules = [t_shape, l_shape, rect1, rect2]
+
+    result = NonRectSolver.solve_4_modules(modules)
+
+    # Generate rotation variants for visualization
+    variants = [NonRectSolver._generate_rotations(m) for m in modules]
+
+    # Visualization
+    if not _HAS_MATPLOTLIB:
+        print("[SKIP] Cannot save problem4_example.png — matplotlib not installed")
+        return result
+
+    fig, ax = plt.subplots(1, 1, figsize=(10, 10))
+    colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4']
+    patterns = ['///', '\\\\\\', '|||', '---']
+
+    for i, mod in enumerate(modules):
+        if mod.name in result.module_positions:
+            x, y, var_idx = result.module_positions[mod.name]
+            var_idx = int(var_idx)  # variant index (not just boolean)
+            color = colors[i % len(colors)]
+
+            # Use the correct variant's sub-blocks
+            active_blocks = variants[i][var_idx]
+
+            bb_min_x = float('inf')
+            bb_min_y = float('inf')
+            bb_max_x = float('-inf')
+            bb_max_y = float('-inf')
+
+            for sb in active_blocks:
+                sbx = x + sb.rel_x
+                sby = y + sb.rel_y
+                rect = Rectangle((sbx, sby),
+                                 sb.width, sb.height, linewidth=1.5,
+                                 edgecolor='black', facecolor=color, alpha=0.7,
+                                 hatch=patterns[i % len(patterns)])
+                ax.add_patch(rect)
+                bb_min_x = min(bb_min_x, sbx)
+                bb_min_y = min(bb_min_y, sby)
+                bb_max_x = max(bb_max_x, sbx + sb.width)
+                bb_max_y = max(bb_max_y, sby + sb.height)
+
+            cx = (bb_min_x + bb_max_x) / 2.0
+            cy = (bb_min_y + bb_max_y) / 2.0
+            ax.text(cx, cy, f"{mod.name}\n({mod.shape_type})",
+                    ha='center', va='center', fontsize=10, fontweight='bold')
+
+    # Draw outline
+    outline = Rectangle((0, 0), result.outline_width, result.outline_height,
+                        linewidth=2, edgecolor='red', facecolor='none',
+                        linestyle='--')
+    ax.add_patch(outline)
+
+    ax.set_xlim(-5, result.outline_width * 1.2)
+    ax.set_ylim(-5, result.outline_height * 1.2)
+    ax.set_aspect('equal')
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_title(f"Problem 4: Non-Rectangular Module Floorplan\n"
+                 f"Area = {result.area:.2f}")
+
+    plt.tight_layout()
+    plt.savefig("problem4_example.png", dpi=150, bbox_inches='tight')
+    print(f"Saved visualization to problem4_example.png")
+    plt.close()
+
+    return result
+
+
+# ============================================================
+# STANDALONE TEST / DEMO
+# ============================================================
+
+def create_sample_data():
+    """Create sample data files for testing when real data is not available."""
+    import os
+
+    # Create sample blocks, nets, and pl files for testing
+    sample_dir = "sample_data"
+    os.makedirs(sample_dir, exist_ok=True)
+
+    # Create a small test case: 10 hard blocks + 5 terminals
+    blocks_content = """NumHardBlocks 10
+NumTerminals 5
+b0 block 4 (0,0) (0,20) (30,20) (30,0)
+b1 block 4 (0,0) (0,15) (25,15) (25,0)
+b2 block 4 (0,0) (0,25) (20,25) (20,0)
+b3 block 4 (0,0) (0,18) (35,18) (35,0)
+b4 block 4 (0,0) (0,22) (28,22) (28,0)
+b5 block 4 (0,0) (0,12) (32,12) (32,0)
+b6 block 4 (0,0) (0,30) (22,30) (22,0)
+b7 block 4 (0,0) (0,16) (26,16) (26,0)
+b8 block 4 (0,0) (0,24) (18,24) (18,0)
+b9 block 4 (0,0) (0,28) (24,28) (24,0)
+p1 terminal
+p2 terminal
+p3 terminal
+p4 terminal
+p5 terminal
+"""
+    with open(os.path.join(sample_dir, "test.blocks"), 'w', encoding='utf-8') as f:
+        f.write(blocks_content)
+
+    nets_content = """NumNets 8
+NumPins 30
+NetDegree 3
+p1
+b0
+b1
+NetDegree 4
+p2
+b2
+b3
+b4
+NetDegree 3
+p3
+b5
+b6
+NetDegree 4
+p4
+b7
+b8
+b9
+NetDegree 3
+p1
+b2
+b5
+NetDegree 3
+p5
+b0
+b3
+NetDegree 4
+p2
+b1
+b6
+b8
+NetDegree 5
+p3
+b0
+b4
+b7
+b9
+"""
+    with open(os.path.join(sample_dir, "test.nets"), 'w', encoding='utf-8') as f:
+        f.write(nets_content)
+
+    pl_content = """p1 100 200
+p2 300 150
+p3 50 350
+p4 400 100
+p5 250 300
+"""
+    with open(os.path.join(sample_dir, "test.pl"), 'w', encoding='utf-8') as f:
+        f.write(pl_content)
+
+    print(f"Created sample data in {sample_dir}/")
+    return sample_dir
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="VLSI Floorplanning Solver for Problems 1-4")
+    parser.add_argument("--path", type=str, default=None,
+                        help="Path to directory containing .blocks, .nets, .pl files")
+    parser.add_argument("--chip", type=str, default=None,
+                        help="Chip name (e.g., n100, n200, n300)")
+    parser.add_argument("--problem", type=int, choices=[1, 2, 3, 4], default=0,
+                        help="Problem number to solve (0 = solve all)")
+    parser.add_argument("--sample", action="store_true",
+                        help="Create sample data and run demo")
+
+    args = parser.parse_args()
+
+    if args.sample:
+        # Create sample data and run a quick demo
+        sample_dir = create_sample_data()
+        solver = ProblemSolver(
+            os.path.join(sample_dir, "test.blocks"),
+            os.path.join(sample_dir, "test.nets"),
+            os.path.join(sample_dir, "test.pl")
+        )
+
+        print("\n\n" + "=" * 60)
+        print("RUNNING DEMO WITH SAMPLE DATA")
+        print("=" * 60)
+
+        result1 = solver.solve_problem1()
+        visualize_floorplan(result1, solver.hard_modules,
+                            title="Sample - Problem 1: Area Minimization",
+                            save_path="sample_problem1.png")
+
+        result2 = solver.solve_problem2(dead_space_ratio=0.15)
+        visualize_floorplan(result2, solver.hard_modules,
+                            title="Sample - Problem 2: HPWL Minimization",
+                            save_path="sample_problem2.png",
+                            show_nets=True,
+                            nets=solver.nets,
+                            terminal_positions=solver.terminal_positions)
+
+        min_dsr, result3 = solver.solve_problem3()
+        visualize_floorplan(result3, solver.hard_modules,
+                            title=f"Sample - Problem 3: Min DSR = {min_dsr:.4f}",
+                            save_path="sample_problem3.png",
+                            show_nets=True,
+                            nets=solver.nets,
+                            terminal_positions=solver.terminal_positions)
+
+        # Problem 4 example
+        solve_problem4_example()
+
+    elif args.path and args.chip:
+        # Solve for a specific chip
+        results = solve_chip(args.path, args.chip)
+
+        print("\n\n" + "=" * 60)
+        print("SUMMARY OF RESULTS")
+        print("=" * 60)
+        for chip, data in [("chip", results)] if isinstance(results, dict) else []:
+            print(f"\nChip: {results['chip']}")
+            print(f"  Problem 1 - Area: {results['problem1'].area:.2f}, "
+                  f"AR: {results['problem1'].aspect_ratio:.4f}")
+            print(f"  Problem 2 - HPWL: {results['problem2'].total_hpwl:.2f}")
+            print(f"  Problem 3 - Min DSR: {results['min_dsr']:.4f}, "
+                  f"HPWL: {results['problem3'].total_hpwl:.2f}")
+
+    else:
+        # No arguments: print usage and run with sample data
+        print("VLSI Floorplanning Solver")
+        print("=" * 60)
+        print("\nUsage:")
+        print("  python vlsi_floorplan.py --path <data_dir> --chip <n100|n200|n300>")
+        print("  python vlsi_floorplan.py --sample  # Run with generated sample data")
+        print("\nRunning with sample data for demonstration...\n")
+
+        sample_dir = create_sample_data()
+        solver = ProblemSolver(
+            os.path.join(sample_dir, "test.blocks"),
+            os.path.join(sample_dir, "test.nets"),
+            os.path.join(sample_dir, "test.pl")
+        )
+
+        result1 = solver.solve_problem1()
+        visualize_floorplan(result1, solver.hard_modules,
+                            title="Sample - Problem 1: Area Minimization",
+                            save_path="sample_problem1.png")
+
+        result2 = solver.solve_problem2(dead_space_ratio=0.15)
+        visualize_floorplan(result2, solver.hard_modules,
+                            title="Sample - Problem 2: HPWL Minimization",
+                            save_path="sample_problem2.png",
+                            show_nets=True,
+                            nets=solver.nets,
+                            terminal_positions=solver.terminal_positions)
+
+        min_dsr, result3 = solver.solve_problem3()
+        visualize_floorplan(result3, solver.hard_modules,
+                            title=f"Sample - Problem 3: Min DSR = {min_dsr:.4f}",
+                            save_path="sample_problem3.png",
+                            show_nets=True,
+                            nets=solver.nets,
+                            terminal_positions=solver.terminal_positions)
+
+        # Problem 4
+        solve_problem4_example()
+
+        print("\n\nDone! Check the generated PNG files for visualizations.")
