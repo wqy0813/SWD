@@ -40,25 +40,53 @@ class BTree:
         """Deep copy the tree."""
         new_tree = BTree(self.num_modules)
         if self.root:
-            new_tree.root = new_tree._copy_node(self.root, None)
+            new_tree.root = new_tree._copy_node(self.root, None, new_tree)
         return new_tree
 
-    def _copy_node(self, node: BTreeNode, parent: Optional[BTreeNode]) -> BTreeNode:
+    def _copy_node(self, node: BTreeNode, parent: Optional[BTreeNode],
+                   new_tree: 'BTree') -> BTreeNode:
         new_node = BTreeNode(node.module_idx)
         new_node.parent = parent
-        new_tree = None
-        # We need a reference to the new tree's nodes list
+        new_tree.nodes[node.module_idx] = new_node
         if node.left:
-            new_node.left = self._copy_node(node.left, new_node)
+            new_node.left = self._copy_node(node.left, new_node, new_tree)
         if node.right:
-            new_node.right = self._copy_node(node.right, new_node)
+            new_node.right = self._copy_node(node.right, new_node, new_tree)
         return new_node
 
     def build_initial_tree(self, module_indices: List[int]):
         """Build an initial balanced-ish B*-tree from a list of module indices."""
+        self.root = None
+        self.nodes = [None] * self.num_modules
         if not module_indices:
             return
         self.root = self._build_balanced(module_indices, 0, len(module_indices) - 1, None)
+
+    def build_left_chain(self, module_indices: List[int]):
+        """构造左孩子链：后续模块不断放到当前模块右侧。"""
+        self._build_chain(module_indices, use_left_child=True)
+
+    def build_right_chain(self, module_indices: List[int]):
+        """构造右孩子链：后续模块不断放到当前模块上方。"""
+        self._build_chain(module_indices, use_left_child=False)
+
+    def _build_chain(self, module_indices: List[int], use_left_child: bool):
+        """按给定顺序构造单链 B*-Tree。"""
+        self.root = None
+        self.nodes = [None] * self.num_modules
+        prev = None
+        for module_idx in module_indices:
+            node = BTreeNode(module_idx)
+            self.nodes[module_idx] = node
+            if prev is None:
+                self.root = node
+            else:
+                node.parent = prev
+                if use_left_child:
+                    prev.left = node
+                else:
+                    prev.right = node
+            prev = node
 
     def _build_balanced(self, indices: List[int], start: int, end: int,
                         parent: Optional[BTreeNode]) -> Optional[BTreeNode]:
@@ -87,7 +115,9 @@ class BTree:
 
     def get_node(self, module_idx: int) -> Optional[BTreeNode]:
         """Find a node by module index."""
-        return self._find(self.root, module_idx)
+        if 0 <= module_idx < len(self.nodes):
+            return self.nodes[module_idx]
+        return None
 
     def _find(self, node: Optional[BTreeNode], module_idx: int) -> Optional[BTreeNode]:
         if node is None:
@@ -105,6 +135,80 @@ class BTree:
         node2 = self.get_node(idx2)
         if node1 and node2:
             node1.module_idx, node2.module_idx = node2.module_idx, node1.module_idx
+            self.nodes[idx1], self.nodes[idx2] = node2, node1
+
+    def is_ancestor(self, ancestor: BTreeNode, node: BTreeNode) -> bool:
+        """判断 ancestor 是否为 node 的祖先节点。"""
+        curr = node
+        while curr is not None:
+            if curr == ancestor:
+                return True
+            curr = curr.parent
+        return False
+
+    def swap_children(self, module_idx: int) -> bool:
+        """交换某个节点的左右子树，用于改变局部 B*-Tree 几何关系。"""
+        node = self.get_node(module_idx)
+        if node is None or (node.left is None and node.right is None):
+            return False
+        node.left, node.right = node.right, node.left
+        return True
+
+    def move_subtree(self, move_idx: int, target_idx: int) -> bool:
+        """
+        将以 move_idx 为根的整棵子树移动到 target_idx 附近。
+
+        中文说明：单节点移动只能改变一个模块的位置；子树移动可以整体重组
+        一片局部布局，是问题一面积搜索中跳出局部最优的重要扰动。
+        """
+        move_node = self.get_node(move_idx)
+        target_node = self.get_node(target_idx)
+        if (
+            move_node is None
+            or target_node is None
+            or move_node == target_node
+            or move_node.parent is None
+            or self.is_ancestor(move_node, target_node)
+        ):
+            return False
+
+        # 中文说明：先从原父节点断开整棵子树，子树内部结构保持不变。
+        old_parent = move_node.parent
+        if old_parent.left == move_node:
+            old_parent.left = None
+        elif old_parent.right == move_node:
+            old_parent.right = None
+        move_node.parent = None
+
+        # 中文说明：随机作为目标节点的左/右孩子插入；被挤下来的原子树
+        # 挂到移动子树中的第一个空孩子位置，避免节点丢失。
+        if random.random() < 0.5:
+            displaced = target_node.left
+            target_node.left = move_node
+        else:
+            displaced = target_node.right
+            target_node.right = move_node
+        move_node.parent = target_node
+
+        if displaced is not None:
+            self._attach_to_first_empty(move_node, displaced)
+        return True
+
+    def _attach_to_first_empty(self, root: BTreeNode, subtree: BTreeNode):
+        """把 subtree 挂到 root 子树中的第一个空孩子位置。"""
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            if node.left is None:
+                node.left = subtree
+                subtree.parent = node
+                return
+            if node.right is None:
+                node.right = subtree
+                subtree.parent = node
+                return
+            stack.append(node.right)
+            stack.append(node.left)
 
     def delete_and_insert(self, delete_idx: int, insert_idx: int):
         """
@@ -120,39 +224,28 @@ class BTree:
 
         # Remove node from tree (replace with its children or delete)
         self._delete_node(node)
+        self.nodes[moved_module] = None
 
         # Insert near target
         target_node = self.get_node(insert_idx)
         if target_node:
-            # Choose random position: as left child or right child
-            if random.random() < 0.5 and target_node.left is None:
-                new_node = BTreeNode(moved_module)
-                new_node.parent = target_node
+            # 中文说明：标准 B*-Tree 移动算子要把模块真正插到目标节点附近。
+            # 旧代码在目标左右孩子都存在时，会退化成“插到第一个空位置”，
+            # 这会让邻域搜索失去局部意义。这里改为：随机选择左/右孩子位置，
+            # 若该位置已有子树，则把原子树挂到新节点同侧，保证节点不丢失。
+            new_node = BTreeNode(moved_module)
+            new_node.parent = target_node
+            self.nodes[moved_module] = new_node
+            if random.random() < 0.5:
+                old_child = target_node.left
                 target_node.left = new_node
-            elif target_node.right is None:
-                new_node = BTreeNode(moved_module)
-                new_node.parent = target_node
-                target_node.right = new_node
+                new_node.left = old_child
             else:
-                # Insert at a random empty spot
-                all_nodes = self.get_all_nodes()
-                for n in all_nodes:
-                    if n.left is None:
-                        new_node = BTreeNode(moved_module)
-                        new_node.parent = n
-                        n.left = new_node
-                        return
-                    if n.right is None:
-                        new_node = BTreeNode(moved_module)
-                        new_node.parent = n
-                        n.right = new_node
-                        return
-                # Fallback: append as right child of last node
-                last = all_nodes[-1] if all_nodes else None
-                if last:
-                    new_node = BTreeNode(moved_module)
-                    new_node.parent = last
-                    last.right = new_node
+                old_child = target_node.right
+                target_node.right = new_node
+                new_node.right = old_child
+            if old_child:
+                old_child.parent = new_node
 
     def _delete_node(self, node: BTreeNode):
         """Delete a node from the B*-tree, reattaching its children."""
@@ -268,24 +361,26 @@ class ContourPacker:
     def _update_contour(self, contour: List[Tuple[float, float, float]],
                         x_start: float, x_end: float, new_y: float):
         """Update the contour (skyline) after placing a block."""
-        # Remove segments covered by new block
         new_contour = []
+        inserted = False
         for seg_xs, seg_xe, seg_y in contour:
             if seg_xe <= x_start or seg_xs >= x_end:
-                # No overlap
+                if not inserted and seg_xs >= x_end:
+                    new_contour.append((x_start, x_end, new_y))
+                    inserted = True
                 new_contour.append((seg_xs, seg_xe, seg_y))
             else:
-                # Partial or full overlap
                 if seg_xs < x_start:
                     new_contour.append((seg_xs, x_start, seg_y))
+                if not inserted:
+                    new_contour.append((x_start, x_end, new_y))
+                    inserted = True
                 if seg_xe > x_end:
                     new_contour.append((x_end, seg_xe, seg_y))
 
-        # Add new segment
-        new_contour.append((x_start, x_end, new_y))
+        if not inserted:
+            new_contour.append((x_start, x_end, new_y))
 
-        # Merge adjacent segments with same height
-        new_contour.sort(key=lambda s: s[0])
         merged = []
         for seg in new_contour:
             if merged and abs(merged[-1][1] - seg[0]) < 1e-9 and abs(merged[-1][2] - seg[2]) < 1e-9:

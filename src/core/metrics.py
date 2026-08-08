@@ -23,9 +23,13 @@ def compute_hpwl(nets: List[Net],
     pin_positions = {}
     for mod in modules:
         if mod.name in module_positions:
-            x, y = module_positions[mod.name]
+            pos = module_positions[mod.name]
+            x, y = pos[0], pos[1]
+            rotated = pos[2] if len(pos) >= 3 else mod.rotated
+            width = mod.height if rotated and mod.is_hard else mod.width
+            height = mod.width if rotated and mod.is_hard else mod.height
             # Pin is at module center
-            pin_positions[mod.name] = (x + mod.w / 2.0, y + mod.h / 2.0)
+            pin_positions[mod.name] = (x + width / 2.0, y + height / 2.0)
 
     for name, (tx, ty) in terminal_positions.items():
         pin_positions[name] = (tx, ty)

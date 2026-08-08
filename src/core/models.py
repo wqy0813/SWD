@@ -66,22 +66,32 @@ class FloorplanResult:
     aspect_ratio: float
     total_hpwl: float = 0.0
     dead_space_ratio: float = 0.0
+    feasible: bool = True
+    verify_info: str = ""
 
 
 @dataclass
 class Problem1Config:
     """问题一专用参数：无固定轮廓，优先压缩面积，再优化长宽比。"""
     seeds: Tuple[int, ...] = (42, 142, 242, 342, 442)
-    area_tolerance: float = 0.03
+    initial_tree_modes: Tuple[str, ...] = ("random_balanced",)
+    area_tie_epsilon: float = 1e-6
     alpha: float = 0.5
     beta: float = 0.0
     target_aspect_ratio: float = 1.0
     t_initial: float = 10.0
     t_final: float = 0.001
     cooling_rate: float = 0.95
-    min_total_iter: int = 3000
-    iter_multiplier: int = 50
+    min_total_iter: int = 24000
+    iter_multiplier: int = 240
     min_iter_per_temp: int = 30
+    stage1_shape_weight: float = 0.0
+    stage2_area_budget_factor: float = 1.0
+    stage2_area_penalty: float = 100.0
+    stage2_min_total_iter: int = 6000
+    stage2_iter_multiplier: int = 60
+    stage1_aspect_ratio_limit: float = 1.0e9
+    stage1_aspect_ratio_penalty: float = 0.0
 
 
 @dataclass
@@ -89,6 +99,7 @@ class Problem2Config:
     """问题二专用参数：固定正方形轮廓，主要优化 HPWL 并惩罚越界。"""
     dead_space_ratio: float = 0.15
     seed: int = 123
+    seeds: Tuple[int, ...] = (123, 223, 323, 423, 523)
     alpha: float = 0.2
     beta: float = 0.6
     target_aspect_ratio: float = 1.0
@@ -99,6 +110,7 @@ class Problem2Config:
     iter_multiplier: int = 80
     min_iter_per_temp: int = 40
     outline_penalty: float = 100000.0
+    feasibility_tolerance: float = 1e-6
 
 
 @dataclass

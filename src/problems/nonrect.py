@@ -8,7 +8,7 @@ import math
 import random
 from typing import List, Tuple
 
-from .models import FloorplanResult, Module, SubBlock
+from ..core.models import FloorplanResult, Module, SubBlock
 
 class NonRectSolver:
     """

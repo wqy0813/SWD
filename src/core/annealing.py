@@ -5,10 +5,9 @@
 
 import math
 import random
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .bstar_tree import BTree, ContourPacker
-from .metrics import compute_hpwl
 from .models import FloorplanResult, Module, Net
 
 class SimulatedAnnealing:
@@ -20,6 +19,7 @@ class SimulatedAnnealing:
     2. Swap: swap two random modules in the B*-tree
     3. Move: delete a module and re-insert it at a different position
     """
+    _normalization_cache = {}
 
     def __init__(self, modules: List[Module], hard_indices: List[int],
                  nets: List[Net] = None,
@@ -66,6 +66,17 @@ class SimulatedAnnealing:
         self.alpha = 0.5
         self.beta = 0.0
         self.target_aspect_ratio = 1.0
+        # 中文说明：问题一改为两阶段优化。
+        # 阶段1严格只优化面积，完全对应题目“面积最小”主目标；
+        # 阶段2在阶段1面积预算内，集中把长宽比推向 1。
+        self.problem1_stage = 1
+        self.problem1_area_budget = None
+        self.problem1_stage1_shape_weight = 0.0
+        self.problem1_stage2_area_penalty = 100.0
+        # 中文说明：问题一最终仍然面积优先；这里的长宽比上限只是搜索护栏，
+        # 防止纯面积目标把 B*-Tree 推入极端细长、反而面积更差的局部最优。
+        self.problem1_stage1_aspect_ratio_limit = 3.0
+        self.problem1_stage1_aspect_ratio_penalty = 0.05
 
         # Objective weights
         self.w_hpwl = 1.0
@@ -81,9 +92,62 @@ class SimulatedAnnealing:
         self.best_positions = None
         self.best_width = 0.0
         self.best_height = 0.0
+        self.normalization_sample_cap = 80
+
+        self._module_name_to_tree_idx = {
+            self.modules[idx].name: tree_idx
+            for tree_idx, idx in enumerate(self.hard_indices)
+        }
+        self._net_pin_refs = []
+        self._net_weights = []
+        for net in self.nets:
+            refs = []
+            for pin_name in net.pins:
+                if pin_name in self._module_name_to_tree_idx:
+                    refs.append((self._module_name_to_tree_idx[pin_name], None))
+                elif pin_name in self.terminal_positions:
+                    refs.append((None, self.terminal_positions[pin_name]))
+            if refs:
+                self._net_pin_refs.append(refs)
+                self._net_weights.append(net.weight)
+
+    def _normalization_cache_key(self, problem_type: int):
+        """Build a dataset/objective key for reusable normalization samples."""
+        hard_modules = tuple(
+            (
+                self.modules[idx].name,
+                self.modules[idx].width,
+                self.modules[idx].height,
+            )
+            for idx in self.hard_indices
+        )
+        nets = tuple(
+            (tuple(net.pins), net.weight)
+            for net in self.nets
+        )
+        terminals = tuple(sorted(self.terminal_positions.items()))
+        outline = None
+        if self.fixed_outline is not None:
+            outline = (
+                round(self.fixed_outline[0], 9),
+                round(self.fixed_outline[1], 9),
+            )
+        return (
+            problem_type,
+            round(self.alpha, 9),
+            round(self.beta, 9),
+            round(self.target_aspect_ratio, 9),
+            outline,
+            hard_modules,
+            nets,
+            terminals,
+        )
 
     def run(self, problem_type: int = 1, dead_space_ratio: float = 0.0,
-            adaptive: bool = True) -> FloorplanResult:
+            adaptive: bool = True, problem1_stage: int = 1,
+            area_budget: Optional[float] = None,
+            init_tree: Optional[BTree] = None,
+            init_rotations: Optional[List[bool]] = None) -> FloorplanResult:
         """
         Run Simulated Annealing.
 
@@ -100,14 +164,22 @@ class SimulatedAnnealing:
         if n == 0:
             return FloorplanResult({}, 0, 0, 0, 0, 0, 0)
 
-        # Initialize tree
-        tree = BTree(n)
-        shuffled = list(range(n))
-        random.shuffle(shuffled)
-        tree.build_initial_tree(shuffled)
+        self.problem1_stage = problem1_stage
+        self.problem1_area_budget = area_budget
 
-        # Initialize rotations (all not rotated)
-        rotations = [False] * n
+        # Initialize tree
+        if init_tree is not None and init_rotations is not None:
+            # 中文说明：两阶段优化时，第二阶段从第一阶段最优 B*-Tree 热启动。
+            tree = init_tree.copy()
+            rotations = init_rotations[:]
+        else:
+            tree = BTree(n)
+            shuffled = list(range(n))
+            random.shuffle(shuffled)
+            tree.build_initial_tree(shuffled)
+
+            # Initialize rotations (all not rotated)
+            rotations = [False] * n
 
         # Compute fixed outline if needed
         if problem_type >= 2 and self.fixed_outline is None:
@@ -120,9 +192,11 @@ class SimulatedAnnealing:
         positions, width, height = self.packer.pack(tree)
 
         # 中文说明：正式计算 cost 前，先估计归一化常数 A_norm 和 W_norm。
-        # 问题一 beta=0 时不会计算线长；问题二 beta>0 时才采样 HPWL。
+        # 问题一固定 A_norm=模块总面积下界，不再用随机采样平均面积覆盖；
+        # 问题二 beta>0 时才采样 HPWL。
+        sample_count = min(max(20, n), self.normalization_sample_cap)
         self._estimate_normalization_constants(
-            tree, rotations, problem_type, max(20, n)
+            tree, rotations, problem_type, sample_count
         )
         current_cost = self._compute_cost(positions, width, height, problem_type)
 
@@ -139,7 +213,7 @@ class SimulatedAnnealing:
             # 论文用若干随机邻域扰动估计平均上坡代价，
             # 再由 P = exp(-Delta_avg / T1) 反推出初始温度 T1。
             avg_uphill = self._estimate_uphill_cost(
-                tree, rotations, current_cost, problem_type, max(20, n)
+                tree, rotations, current_cost, problem_type, sample_count
             )
             if avg_uphill > 0:
                 T1 = max(
@@ -181,10 +255,9 @@ class SimulatedAnnealing:
                 tree, rotations, current_cost, stuck_count = self._attempt_move(
                     tree, rotations, current_cost, problem_type, T, stuck_count
                 )
-                T *= self.cooling_rate
+                # 中文说明：第三阶段不提前退出，保证预算真正用于重热后的局部细化。
+                T = max(self.T_final, T * self.cooling_rate)
                 iteration += 1
-                if T <= self.T_final:
-                    break
         else:
             # 中文说明：保留普通模拟退火作为对照实验，不使用 Fast-SA 三阶段。
             T = self.T_initial
@@ -217,9 +290,7 @@ class SimulatedAnnealing:
         # Compute HPWL
         total_hpwl = 0.0
         if self.nets:
-            pos_for_hpwl = {name: (x, y) for name, (x, y, _) in module_positions.items()}
-            total_hpwl = compute_hpwl(self.nets, pos_for_hpwl,
-                                      self.modules, self.terminal_positions)
+            total_hpwl = self._compute_hpwl_for_positions(self.best_positions)
 
         # Compute actual dead space ratio
         total_block_area = sum(self.modules[i].area for i in self.hard_indices)
@@ -241,11 +312,14 @@ class SimulatedAnnealing:
             self.modules[idx].rotated = rotations[i]
 
     def _perturb(self, tree: BTree, rotations: List[bool]):
-        """生成一个 B*-Tree 邻域解：旋转、交换或移动模块。"""
+        """生成一个 B*-Tree 邻域解：旋转、交换、移动模块或重组子树。"""
         n = len(self.hard_indices)
         move_type = random.choices(
-            [1, 2, 3],
-            weights=[0.3, 0.4, 0.3],
+            [1, 2, 3, 4, 5],
+            # 中文说明：子树扰动代码已保留作对照实验；但问题一严格面积
+            # 优先时，小样本测试发现子树扰动会提高长宽比却略增面积，
+            # 因此默认仍采用论文中最基础的旋转/交换/移动三类扰动。
+            weights=[0.30, 0.40, 0.30, 0.00, 0.00],
             k=1
         )[0]
 
@@ -253,23 +327,38 @@ class SimulatedAnnealing:
             # 中文说明：旋转操作只改变模块方向，不改变 B*-Tree 拓扑。
             rotation_pos = random.randrange(n)
             rotations[rotation_pos] = not rotations[rotation_pos]
+            return ('rotate', rotation_pos)
         elif move_type == 2:
             # 中文说明：交换操作改变两个节点对应的模块。
             i1, i2 = random.sample(range(n), 2)
             tree.swap_modules(i1, i2)
-        else:
+            return ('swap', (i1, i2))
+        elif move_type == 3:
             # 中文说明：移动操作把一个节点删除后插入到另一节点附近。
             i1, i2 = random.sample(range(n), 2)
+            old_tree = tree.copy()
             tree.delete_and_insert(i1, i2)
+            return ('tree', old_tree)
+        elif move_type == 4:
+            # 中文说明：移动整棵子树，增强 B*-Tree 对大块局部结构的重组能力。
+            i1, i2 = random.sample(range(n), 2)
+            old_tree = tree.copy()
+            tree.move_subtree(i1, i2)
+            return ('tree', old_tree)
+
+        # 中文说明：交换某个节点的左右子树，相当于局部改变“右侧/上方”关系。
+        i = random.randrange(n)
+        old_tree = tree.copy()
+        tree.swap_children(i)
+        return ('tree', old_tree)
 
     def _attempt_move(self, tree: BTree, rotations: List[bool],
                       current_cost: float, problem_type: int, temperature: float,
                       stuck_count: int):
         """尝试一次邻域扰动，并按模拟退火准则接受或恢复。"""
-        old_tree = tree.copy()
         old_rotations = rotations[:]
 
-        self._perturb(tree, rotations)
+        undo_info = self._perturb(tree, rotations)
         self._apply_rotations(rotations)
         positions, width, height = self.packer.pack(tree)
         new_cost = self._compute_cost(positions, width, height, problem_type)
@@ -295,7 +384,12 @@ class SimulatedAnnealing:
 
         # 中文说明：拒绝新解时恢复扰动前的树和旋转状态。
         self._apply_rotations(old_rotations)
-        return old_tree, old_rotations, current_cost, stuck_count + 1
+        if undo_info[0] == 'swap':
+            i1, i2 = undo_info[1]
+            tree.swap_modules(i1, i2)
+        elif undo_info[0] == 'tree':
+            tree = undo_info[1]
+        return tree, old_rotations, current_cost, stuck_count + 1
 
     def _estimate_uphill_cost(self, tree: BTree, rotations: List[bool],
                               current_cost: float, problem_type: int,
@@ -330,18 +424,69 @@ class SimulatedAnnealing:
 
     def _compute_hpwl_for_positions(self, positions: Dict) -> float:
         """计算当前布局的 HPWL；没有线网时返回 0。"""
-        if not self.nets:
+        if not self._net_pin_refs:
             return 0.0
-        return compute_hpwl(
-            self.nets,
-            self._module_positions_for_hpwl(positions),
-            self.modules,
-            self.terminal_positions
-        )
+        total_hpwl = 0.0
+        modules = self.modules
+        hard_indices = self.hard_indices
+        center_x = [None] * len(hard_indices)
+        center_y = [None] * len(hard_indices)
+        for tree_idx, pos in positions.items():
+            mod = modules[hard_indices[tree_idx]]
+            center_x[tree_idx] = pos[0] + mod.w * 0.5
+            center_y[tree_idx] = pos[1] + mod.h * 0.5
+
+        for refs, weight in zip(self._net_pin_refs, self._net_weights):
+            min_x = float('inf')
+            max_x = float('-inf')
+            min_y = float('inf')
+            max_y = float('-inf')
+            found = False
+            for tree_idx, terminal_xy in refs:
+                if tree_idx is None:
+                    px, py = terminal_xy
+                else:
+                    px = center_x[tree_idx]
+                    if px is None:
+                        continue
+                    py = center_y[tree_idx]
+
+                if px < min_x:
+                    min_x = px
+                if px > max_x:
+                    max_x = px
+                if py < min_y:
+                    min_y = py
+                if py > max_y:
+                    max_y = py
+                found = True
+
+            if found:
+                total_hpwl += ((max_x - min_x) + (max_y - min_y)) * weight
+
+        return total_hpwl
 
     def _estimate_normalization_constants(self, tree: BTree, rotations: List[bool],
                                           problem_type: int, sample_count: int):
         """通过预热采样估计 A_norm 和 W_norm，对应论文中的归一化分母。"""
+        if problem_type == 1:
+            # 中文说明：问题一没有固定轮廓和连线，面积的天然归一化分母
+            # 就是全部模块面积和，也就是理论面积下界。
+            self.area_norm = max(self.total_block_area, 1e-9)
+            self.wirelength_norm = 1.0
+            return
+
+        if problem_type != 2:
+            self.area_norm = max(self.total_block_area, 1e-9)
+            self.wirelength_norm = 1.0
+            return
+
+        cache_key = self._normalization_cache_key(problem_type)
+        cached = SimulatedAnnealing._normalization_cache.get(cache_key)
+        if cached is not None:
+            self.area_norm, self.wirelength_norm = cached
+            return
+
         areas = []
         wirelengths = []
 
@@ -372,6 +517,11 @@ class SimulatedAnnealing:
         else:
             self.wirelength_norm = 1.0
 
+        SimulatedAnnealing._normalization_cache[cache_key] = (
+            self.area_norm,
+            self.wirelength_norm,
+        )
+
     def _compute_unified_floorplan_cost(self, positions: Dict,
                                         width: float, height: float) -> float:
         """统一归一化代价函数，问题一和问题二共用这一套公式。"""
@@ -394,15 +544,37 @@ class SimulatedAnnealing:
             + shape_weight * cost_shape
         )
 
+    def _compute_problem1_cost(self, width: float, height: float) -> float:
+        """问题一两阶段归一化目标函数。"""
+        area = width * height
+        aspect_ratio = max(width, height) / max(1e-9, min(width, height))
+        area_cost = area / max(self.area_norm, 1e-9)
+        shape_cost = (aspect_ratio - self.target_aspect_ratio) ** 2
+
+        if self.problem1_stage == 1:
+            # 中文说明：阶段1仍以面积为主；只有长宽比超过上限时才加护栏惩罚。
+            if aspect_ratio <= self.problem1_stage1_aspect_ratio_limit:
+                return area_cost
+            overflow = aspect_ratio - self.problem1_stage1_aspect_ratio_limit
+            return (
+                area_cost
+                + self.problem1_stage1_aspect_ratio_penalty * overflow ** 2
+            )
+
+        budget = self.problem1_area_budget or area
+        over_budget_ratio = max(0.0, area - budget) / max(budget, 1e-9)
+        # 中文说明：阶段2不是重新追求更大正方形，而是在阶段1面积预算内修正比例。
+        return shape_cost + self.problem1_stage2_area_penalty * over_budget_ratio
+
     def _compute_cost(self, positions: Dict, width: float, height: float,
                       problem_type: int) -> float:
         """Compute the cost function based on problem type."""
         cost = 0.0
 
         if problem_type == 1:
-            # 中文说明：问题一没有连接关系，所以 beta=0，统一公式自动退化为
-            # alpha*A/A_norm + (1-alpha)*(R-1)^2。
-            cost = self._compute_unified_floorplan_cost(positions, width, height)
+            # 中文说明：问题一采用两阶段目标：
+            # stage 1 面积主导；stage 2 在面积预算内优化长宽比。
+            cost = self._compute_problem1_cost(width, height)
 
         elif problem_type == 2:
             # Minimize HPWL with fixed outline constraint
