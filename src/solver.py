@@ -110,7 +110,11 @@ class ProblemSolver:
             sa.T_initial = cfg.t_initial
             sa.T_final = cfg.t_final
             sa.cooling_rate = cfg.cooling_rate
-            sa.lambda_ar = cfg.lambda_ar
+            # 中文说明：问题一代入统一公式：beta=0，R*=1。
+            # Cost = alpha*A/A_norm + (1-alpha)*(R-1)^2
+            sa.alpha = cfg.alpha
+            sa.beta = cfg.beta
+            sa.target_aspect_ratio = cfg.target_aspect_ratio
             sa.max_iter_per_temp = max(cfg.min_iter_per_temp, len(trial_modules))
             sa.max_total_iter = max(
                 cfg.min_total_iter,
@@ -202,7 +206,10 @@ class ProblemSolver:
             len(self.hard_modules) * cfg.iter_multiplier
         )
         sa.w_outline = cfg.outline_penalty
-        sa.w_hpwl = 1.0
+        # 中文说明：问题二也使用统一归一化公式，但额外叠加固定轮廓越界惩罚。
+        sa.alpha = cfg.alpha
+        sa.beta = cfg.beta
+        sa.target_aspect_ratio = cfg.target_aspect_ratio
 
         result = sa.run(problem_type=2, dead_space_ratio=dead_space_ratio)
 
@@ -339,6 +346,9 @@ class ProblemSolver:
             len(self.hard_modules) * cfg.iter_multiplier
         )
         sa.w_outline = cfg.outline_penalty
+        sa.alpha = cfg.alpha
+        sa.beta = cfg.beta
+        sa.target_aspect_ratio = cfg.target_aspect_ratio
         return sa.run(problem_type=2, dead_space_ratio=dsr)
 
     def solve_problem4(self, custom_modules: List[Module] = None) -> FloorplanResult:

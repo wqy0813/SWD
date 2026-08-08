@@ -51,12 +51,21 @@ class SimulatedAnnealing:
         self.fast_sa_stage2_ratio = 0.25
         self.fast_sa_stage2_cooling = 0.85
 
-        # 中文说明：问题一需要用模块总面积对外接矩形面积归一化。
-        # 该值是固定数据集的理论面积下界，不包含死区。
+        # 中文说明：total_block_area 是固定数据集的理论面积下界。
+        # area_norm 和 wirelength_norm 会在 run() 开始时通过随机采样估计，
+        # 对应论文中 A_norm、W_norm 的归一化思想。
         self.total_block_area = sum(
             self.modules[i].area for i in self.hard_indices
         )
-        self.lambda_ar = 0.02
+        self.area_norm = max(self.total_block_area, 1e-9)
+        self.wirelength_norm = 1.0
+
+        # 中文说明：统一代价函数的三个参数。
+        # Cost = alpha * A/A_norm + beta * W/W_norm
+        #        + (1 - alpha - beta) * (R - R*)^2
+        self.alpha = 0.5
+        self.beta = 0.0
+        self.target_aspect_ratio = 1.0
 
         # Objective weights
         self.w_hpwl = 1.0
@@ -109,6 +118,12 @@ class SimulatedAnnealing:
         # Initial packing
         self._apply_rotations(rotations)
         positions, width, height = self.packer.pack(tree)
+
+        # 中文说明：正式计算 cost 前，先估计归一化常数 A_norm 和 W_norm。
+        # 问题一 beta=0 时不会计算线长；问题二 beta>0 时才采样 HPWL。
+        self._estimate_normalization_constants(
+            tree, rotations, problem_type, max(20, n)
+        )
         current_cost = self._compute_cost(positions, width, height, problem_type)
 
         # Best tracking
@@ -305,21 +320,89 @@ class SimulatedAnnealing:
             return 0.0
         return sum(uphill_costs) / len(uphill_costs)
 
+    def _module_positions_for_hpwl(self, positions: Dict) -> Dict[str, Tuple[float, float]]:
+        """把 B*-Tree 的内部下标坐标转换成模块名坐标，用于 HPWL 计算。"""
+        mod_pos = {}
+        for tree_idx, (x, y) in positions.items():
+            mod = self.modules[self.hard_indices[tree_idx]]
+            mod_pos[mod.name] = (x, y)
+        return mod_pos
+
+    def _compute_hpwl_for_positions(self, positions: Dict) -> float:
+        """计算当前布局的 HPWL；没有线网时返回 0。"""
+        if not self.nets:
+            return 0.0
+        return compute_hpwl(
+            self.nets,
+            self._module_positions_for_hpwl(positions),
+            self.modules,
+            self.terminal_positions
+        )
+
+    def _estimate_normalization_constants(self, tree: BTree, rotations: List[bool],
+                                          problem_type: int, sample_count: int):
+        """通过预热采样估计 A_norm 和 W_norm，对应论文中的归一化分母。"""
+        areas = []
+        wirelengths = []
+
+        positions, width, height = self.packer.pack(tree)
+        areas.append(width * height)
+        if self.beta > 0:
+            wirelengths.append(self._compute_hpwl_for_positions(positions))
+
+        for _ in range(sample_count):
+            trial_tree = tree.copy()
+            trial_rotations = rotations[:]
+            self._perturb(trial_tree, trial_rotations)
+            self._apply_rotations(trial_rotations)
+            trial_positions, trial_width, trial_height = self.packer.pack(trial_tree)
+            areas.append(trial_width * trial_height)
+            if self.beta > 0:
+                wirelengths.append(self._compute_hpwl_for_positions(trial_positions))
+
+        self._apply_rotations(rotations)
+
+        if areas:
+            self.area_norm = max(sum(areas) / len(areas), 1e-9)
+        else:
+            self.area_norm = max(self.total_block_area, 1e-9)
+
+        if wirelengths and max(wirelengths) > 0:
+            self.wirelength_norm = max(sum(wirelengths) / len(wirelengths), 1e-9)
+        else:
+            self.wirelength_norm = 1.0
+
+    def _compute_unified_floorplan_cost(self, positions: Dict,
+                                        width: float, height: float) -> float:
+        """统一归一化代价函数，问题一和问题二共用这一套公式。"""
+        area = width * height
+        aspect_ratio = max(width, height) / max(1e-9, min(width, height))
+
+        cost_area = area / max(self.area_norm, 1e-9)
+        if self.beta > 0:
+            wirelength = self._compute_hpwl_for_positions(positions)
+            cost_wirelength = wirelength / max(self.wirelength_norm, 1e-9)
+        else:
+            cost_wirelength = 0.0
+
+        shape_weight = max(0.0, 1.0 - self.alpha - self.beta)
+        cost_shape = (aspect_ratio - self.target_aspect_ratio) ** 2
+
+        return (
+            self.alpha * cost_area
+            + self.beta * cost_wirelength
+            + shape_weight * cost_shape
+        )
+
     def _compute_cost(self, positions: Dict, width: float, height: float,
                       problem_type: int) -> float:
         """Compute the cost function based on problem type."""
         cost = 0.0
 
         if problem_type == 1:
-            # 中文说明：问题一不考虑 HPWL，只优化面积和外接矩形长宽比。
-            # 面积先用模块总面积归一化，避免不同规模数据集的代价数量级差异。
-            area = width * height
-            ar = max(width, height) / max(1e-9, min(width, height))
-            area_norm = area / max(self.total_block_area, 1e-9)
-
-            # 中文说明：长宽比是二级目标，平方惩罚让 ar 越接近 1 越好。
-            # 问题一删除论文公式中的 W/W_norm 线长项。
-            cost = area_norm + self.lambda_ar * (ar - 1.0) ** 2
+            # 中文说明：问题一没有连接关系，所以 beta=0，统一公式自动退化为
+            # alpha*A/A_norm + (1-alpha)*(R-1)^2。
+            cost = self._compute_unified_floorplan_cost(positions, width, height)
 
         elif problem_type == 2:
             # Minimize HPWL with fixed outline constraint
@@ -328,17 +411,10 @@ class SimulatedAnnealing:
             outline_penalty = max(0, width - ow) + max(0, height - oh)
             outline_penalty *= self.w_outline
 
-            # Compute HPWL
-            hpwl = 0.0
-            if self.nets:
-                mod_pos = {}
-                for tree_idx, (x, y) in positions.items():
-                    mod = self.modules[self.hard_indices[tree_idx]]
-                    mod_pos[mod.name] = (x, y)
-                hpwl = compute_hpwl(self.nets, mod_pos,
-                                    self.modules, self.terminal_positions)
-
-            cost = hpwl + outline_penalty
+            # 中文说明：问题二在统一公式基础上额外加入固定轮廓越界惩罚。
+            cost = self._compute_unified_floorplan_cost(
+                positions, width, height
+            ) + outline_penalty
 
         elif problem_type == 3:
             # Feasibility check: only penalty for outline violation

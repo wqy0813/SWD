@@ -73,7 +73,9 @@ class Problem1Config:
     """问题一专用参数：无固定轮廓，优先压缩面积，再优化长宽比。"""
     seeds: Tuple[int, ...] = (42, 142, 242, 342, 442)
     area_tolerance: float = 0.03
-    lambda_ar: float = 0.02
+    alpha: float = 0.5
+    beta: float = 0.0
+    target_aspect_ratio: float = 1.0
     t_initial: float = 10.0
     t_final: float = 0.001
     cooling_rate: float = 0.95
@@ -87,6 +89,9 @@ class Problem2Config:
     """问题二专用参数：固定正方形轮廓，主要优化 HPWL 并惩罚越界。"""
     dead_space_ratio: float = 0.15
     seed: int = 123
+    alpha: float = 0.2
+    beta: float = 0.6
+    target_aspect_ratio: float = 1.0
     t_initial: float = 5000.0
     t_final: float = 0.01
     cooling_rate: float = 0.95
